@@ -14,10 +14,16 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA
 
 # This file is symlinked into <mysql-src>/plugin/selective_trace by
-# scripts/build.sh, so paths are relative to this directory (src/), with
-# ../core/ reaching the shared filter_engine sources.
+# scripts/build.sh. CMake resolves relative source paths against the
+# *logical* directory of that symlink (plugin/selective_trace), not its
+# real target — so a "../core/..." source path would resolve to
+# <mysql-src>/plugin/core, which does not exist, instead of this repo's
+# core/. To keep the path relative and inside this directory's own tree
+# (which CMake resolves correctly through the symlink), core/ is reached
+# via a second symlink, src/core -> ../core (created once, checked into
+# git as a symlink) rather than "..".
 
-INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/../core)
+INCLUDE_DIRECTORIES(${CMAKE_CURRENT_SOURCE_DIR}/core)
 
 SET(SELECTIVE_TRACE_SOURCES
     selective_trace_mysql.cc
@@ -25,8 +31,8 @@ SET(SELECTIVE_TRACE_SOURCES
     log_writer_file_mysql.h
     log_writer_table_mysql.cc
     log_writer_table_mysql.h
-    ../core/filter_engine.cc
-    ../core/filter_engine.h)
+    core/filter_engine.cc
+    core/filter_engine.h)
 
 # MYSQL_ADD_PLUGIN is the MySQL-source-tree equivalent of MariaDB's macro
 # of the same name; unlike the MariaDB build, MODULE_ONLY needs no

@@ -16,16 +16,23 @@ choice was made.
 
 ## Status
 
-**Etapa 0/1 in progress — not yet built or validated against a real MySQL
-server.** The filter engine (`core/`) is ported, unit-tested and passing
-(160/160 checks, verified in this repo via a `gcc:13` container). The
-MySQL-specific layer (`src/`) is written against the Audit API facts
-confirmed in `CLAUDE.md` §2, but has three points that need confirmation
-against a real MySQL 8.0 source tree before it can be trusted — see
-[`docs/RESEARCH_NOTES_MYSQL.md`](docs/RESEARCH_NOTES_MYSQL.md) for exactly
-what and why. Do not deploy this to production yet.
+**Etapa 1 done — compiles and links against a real MySQL 8.0.40 source
+tree; not yet run against a live server (Etapa 5).** The filter engine
+(`core/`) is ported, unit-tested and passing (160/160 checks). The
+MySQL-specific layer (`src/`) was built end-to-end via
+`docker/Dockerfile` + `scripts/build.sh` against a real `mysql-server`
+tag `mysql-8.0.40` checkout: `selective_trace.so` compiles with zero
+warnings and exports the symbols expected of a dynamic plugin
+(`_mysql_plugin_declarations_`, verified with `nm -D`). What's *not* done
+yet is loading it into a running `mysqld` (`INSTALL PLUGIN`) and any
+functional exercise (FILE, TABLE, filters) — see
+[`docs/RESEARCH_NOTES_MYSQL.md`](docs/RESEARCH_NOTES_MYSQL.md) for the
+exact remaining scope (Etapa 5) and for the real compiler-verified facts
+that corrected several MariaDB-shaped assumptions along the way (e.g.
+`SYS_VAR`/`SHOW_VAR`, not `st_mysql_sys_var`/`st_mysql_show_var`, which
+don't exist in MySQL). Do not deploy this to production yet.
 
-## Quick start (once Etapa 1 validation is done)
+## Quick start (once Etapa 5 validation is done)
 
 ```sql
 INSTALL PLUGIN selective_trace SONAME 'selective_trace.so';
@@ -53,8 +60,11 @@ docker run --rm -it -v "$PWD:/workspace" selective-trace-mysql-dev
 ./scripts/build.sh --package   # copy the .so to build/plugin_output/
 ```
 
-See [`docs/RESEARCH_NOTES_MYSQL.md`](docs/RESEARCH_NOTES_MYSQL.md) for
-what to confirm against the real MySQL headers before trusting a build.
+This has been run successfully in this repo (source clone + configure +
+build + incremental plugin rebuild + package, ~30-45 min the first time,
+seconds after with the ccache/build volumes warm). See
+[`docs/RESEARCH_NOTES_MYSQL.md`](docs/RESEARCH_NOTES_MYSQL.md) for the
+exact reproduction steps and volume setup.
 
 ## Repository layout
 

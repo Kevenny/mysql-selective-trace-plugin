@@ -146,11 +146,39 @@ repo antes desta sessão (inconsistência corrigida a pedido do usuário).
 - `core/test_filter_logic.cc` compilado e executado dentro de um
   container `gcc:13` (`g++ -std=c++17 -Wall -Wextra -Werror`): **160/160
   checks OK**.
-- **Não** foi possível compilar `src/selective_trace_mysql.cc` /
-  `log_writer_file_mysql.cc` / `log_writer_table_mysql.cc` nesta sessão —
-  exigem os headers reais do MySQL 8.0 (`mysql/plugin.h`,
-  `mysql/plugin_audit.h`, `mysql/components/services/
-  mysql_command_services.h`), que não foram baixados/montados neste
-  ambiente. Etapa 1 (`scripts/build.sh` dentro de `docker/Dockerfile`)
-  é o próximo passo real de validação — ver
-  `docs/RESEARCH_NOTES_MYSQL.md`.
+- **Etapa 1 fechada na mesma sessão, em seguida**: `docker/Dockerfile` foi
+  buildado, um `mysql-server` tag `mysql-8.0.40` real foi clonado
+  (`scripts/build.sh full`), e `src/` foi compilado e linkado contra os
+  headers reais via `ninja selective_trace` — zero warnings no fim,
+  `selective_trace.so` gerado e com os símbolos esperados de plugin
+  dinâmico (`_mysql_plugin_declarations_`, verificado com `nm -D`). O
+  fluxo documentado completo (`scripts/build.sh full|--plugin|--package`)
+  foi exercitado de ponta a ponta com sucesso.
+- Isso só saiu limpo depois de **corrigir vários erros reais** que só um
+  compilador real contra os headers reais podia pegar — nenhum deles era
+  visível por inspeção (todos pareciam corretos por analogia com o
+  MariaDB antes da compilação real):
+  - `SYS_VAR`/`SHOW_VAR`, não `st_mysql_sys_var`/`st_mysql_show_var`
+    (esses nomes não existem no MySQL — são do MariaDB).
+  - `SHOW_VAR` tem 4 campos (`name,value,type,scope`), não 3; o callback
+    `SHOW_FUNC` tem 3 parâmetros, não 5; não existe `SHOW_ULONG`.
+  - `event_notify` usa `MYSQL_THD`, não `void*` — um arquivo `.pp`
+    (snapshot pré-processado, também presente na árvore) sugeria o
+    contrário e estava desatualizado/enganoso.
+  - `mysql_rwlock_t` e companhia vêm de `<mysql/psi/mysql_rwlock.h>`,
+    que `<mysql/psi/mysql_thread.h>` não inclui sozinho; `TYPELIB` vem de
+    `<typelib.h>`; `array_elements` é um template em
+    `<template_utils.h>`, não uma macro.
+  - `mysql_command_error_info::sql_errno()` escreve por ponteiro de
+    saída, não retorna o valor.
+  - Um symlink `../core/filter_engine.cc` no `CMakeLists.txt` não
+    resolvia dentro da árvore do MySQL porque o CMake resolve caminhos
+    relativos contra o diretório *lógico* do symlink do plugin, não seu
+    alvo real — corrigido com um segundo symlink `src/core -> ../core`
+    (fica dentro da árvore, sem precisar de `..`).
+  - Todos os detalhes e o texto exato dos headers reais estão em
+    `docs/RESEARCH_NOTES_MYSQL.md`.
+- **Ainda não exercido**: `INSTALL PLUGIN` num `mysqld` real, e qualquer
+  comportamento em runtime (FILE, TABLE, filtros, `mysql_command_services`
+  executando uma query de verdade). Isso é Etapa 5 — precisa de um
+  servidor de pé, não só compilar.

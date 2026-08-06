@@ -64,7 +64,10 @@
 #include <mysql/plugin.h>
 #include <mysql/plugin_audit.h>
 #include <mysql/psi/mysql_thread.h>
+#include <mysql/psi/mysql_rwlock.h>  /* mysql_thread.h does NOT pull this in */
 #include <mysqld_error.h>
+#include <template_utils.h>   /* array_elements() — a template in 8.0, not a macro */
+#include <typelib.h>           /* TYPELIB, used by MYSQL_SYSVAR_ENUM */
 
 #include <new>
 #include <string>
@@ -73,7 +76,7 @@
 #include <ctime>
 #include <sys/time.h>
 
-#include "../core/filter_engine.h"
+#include "core/filter_engine.h"
 #include "log_writer_file_mysql.h"
 #include "log_writer_table_mysql.h"
 
@@ -213,7 +216,7 @@ static TYPELIB output_typelib=
 };
 
 static int check_filter_list(MYSQL_THD thd __attribute__((unused)),
-                             struct st_mysql_sys_var *var,
+                             SYS_VAR *var,
                              void *save, struct st_mysql_value *value,
                              int is_table_list)
 try
@@ -250,20 +253,20 @@ catch (...)
   return 1;
 }
 
-static int check_schemas(MYSQL_THD thd, struct st_mysql_sys_var *var,
+static int check_schemas(MYSQL_THD thd, SYS_VAR *var,
                                 void *save, struct st_mysql_value *value)
 {
   return check_filter_list(thd, var, save, value, 0);
 }
 
-static int check_tables(MYSQL_THD thd, struct st_mysql_sys_var *var,
+static int check_tables(MYSQL_THD thd, SYS_VAR *var,
                                void *save, struct st_mysql_value *value)
 {
   return check_filter_list(thd, var, save, value, 1);
 }
 
 static int check_connections(MYSQL_THD thd __attribute__((unused)),
-                                    struct st_mysql_sys_var *var
+                                    SYS_VAR *var
                                       __attribute__((unused)),
                                     void *save, struct st_mysql_value *value)
 try
@@ -349,7 +352,7 @@ static void update_filter_list(void *var_ptr, const void *save,
 }
 
 static void update_schemas(MYSQL_THD thd __attribute__((unused)),
-                                  struct st_mysql_sys_var *var
+                                  SYS_VAR *var
                                     __attribute__((unused)),
                                   void *var_ptr, const void *save)
 {
@@ -357,7 +360,7 @@ static void update_schemas(MYSQL_THD thd __attribute__((unused)),
 }
 
 static void update_tables(MYSQL_THD thd __attribute__((unused)),
-                                 struct st_mysql_sys_var *var
+                                 SYS_VAR *var
                                    __attribute__((unused)),
                                  void *var_ptr, const void *save)
 {
@@ -365,7 +368,7 @@ static void update_tables(MYSQL_THD thd __attribute__((unused)),
 }
 
 static void update_connections(MYSQL_THD thd __attribute__((unused)),
-                                       struct st_mysql_sys_var *var
+                                       SYS_VAR *var
                                          __attribute__((unused)),
                                        void *var_ptr, const void *save)
 {
@@ -373,7 +376,7 @@ static void update_connections(MYSQL_THD thd __attribute__((unused)),
 }
 
 static void update_file_path(MYSQL_THD thd __attribute__((unused)),
-                                 struct st_mysql_sys_var *var
+                                 SYS_VAR *var
                                    __attribute__((unused)),
                                  void *var_ptr, const void *save)
 {
@@ -449,7 +452,7 @@ static MYSQL_SYSVAR_BOOL(mask_passwords, opt_mask_passwords,
   " with *** before logging. On by default.",
   NULL, NULL, true);
 
-static struct st_mysql_sys_var *selective_trace_sysvars[]=
+static SYS_VAR *selective_trace_sysvars[]=
 {
   MYSQL_SYSVAR(enabled),
   MYSQL_SYSVAR(schemas),
@@ -468,57 +471,46 @@ static ulong status_events_logged= 0;
 static ulong status_write_failures= 0;
 static ulong status_events_dropped= 0;
 
+/*
+  Confirmed against the real MySQL 8.0.40 headers (include/mysql/status_var.h):
+  the plugin-facing type is SHOW_VAR (not st_mysql_show_var, which doesn't
+  exist in MySQL — that name is MariaDB's), it has 4 fields
+  (name, value, type, scope), there is no SHOW_ULONG (SHOW_LONG is already
+  "shown as unsigned long"), and the SHOW_FUNC callback signature is
+  int(MYSQL_THD, SHOW_VAR *, char *) — 3 parameters, not 5 like MariaDB's.
+*/
 static int show_write_failures(MYSQL_THD thd __attribute__((unused)),
-                               struct st_mysql_show_var *var,
-                               void *buff,
-                               struct system_status_var *status
-                                 __attribute__((unused)),
-                               enum enum_var_type scope
-                                 __attribute__((unused)))
+                               SHOW_VAR *var,
+                               char *buff __attribute__((unused)))
 {
   status_write_failures= selective_trace::file_writer_failures() +
                          selective_trace::table_writer_failures();
-  var->type= SHOW_ULONG;
+  var->type= SHOW_LONG;
   var->value= (char *) &status_write_failures;
-  (void) buff;
   return 0;
 }
 
 static int show_events_dropped(MYSQL_THD thd __attribute__((unused)),
-                               struct st_mysql_show_var *var,
-                               void *buff,
-                               struct system_status_var *status
-                                 __attribute__((unused)),
-                               enum enum_var_type scope
-                                 __attribute__((unused)))
+                               SHOW_VAR *var,
+                               char *buff __attribute__((unused)))
 {
   status_events_dropped= selective_trace::table_writer_dropped();
-  var->type= SHOW_ULONG;
+  var->type= SHOW_LONG;
   var->value= (char *) &status_events_dropped;
-  (void) buff;
   return 0;
 }
 
-/*
-  Deliberately 3-field aggregate init ({name, value, type}), same shape as
-  the MariaDB plugin. MySQL 8.0's st_mysql_show_var *may* have grown a
-  trailing scope field (SHOW_SCOPE_GLOBAL/...) — if so, the compiler
-  zero-fills it from this shorter initializer list (legal C++ aggregate
-  init), which is safe here since every one of these is in fact a global.
-  Confirm against the real plugin.h; do not add a 4th field speculatively
-  (too many initializers is a hard compile error, too few is not).
-*/
-static struct st_mysql_show_var selective_trace_status[]=
+static SHOW_VAR selective_trace_status[]=
 {
   { "selective_trace_events_logged", (char *) &status_events_logged,
-    SHOW_ULONG },
+    SHOW_LONG, SHOW_SCOPE_GLOBAL },
   { "selective_trace_write_failures", (char *) show_write_failures,
-    SHOW_FUNC },
+    SHOW_FUNC, SHOW_SCOPE_GLOBAL },
   { "selective_trace_events_dropped", (char *) show_events_dropped,
-    SHOW_FUNC },
+    SHOW_FUNC, SHOW_SCOPE_GLOBAL },
   { "selective_trace_callback_errors", (char *) &status_callback_errors,
-    SHOW_ULONG },
-  { 0, 0, SHOW_UNDEF }
+    SHOW_LONG, SHOW_SCOPE_GLOBAL },
+  { 0, 0, SHOW_UNDEF, SHOW_SCOPE_UNDEF }
 };
 
 /* ------------------------------------------------------------------------
@@ -594,8 +586,8 @@ static void track_current_db(StatementState *st,
 
   /* Skip past "USE" (case-insensitive) and following whitespace; this is
      a light-weight re-scan, not a full re-run of extract_command's
-     comment-skipping — statements of the form "/* c *‍/ USE db" are not
-     recognized as USE by this second pass and current_db is left
+     comment-skipping — a USE statement preceded by a block comment is
+     not recognized as USE by this second pass, and current_db is left
      unchanged (safe default: stale but not wrong). */
   const char *p= event->general_query.str;
   const char *end= p + event->general_query.length;
@@ -813,7 +805,9 @@ static void handle_status_event(MYSQL_THD thd,
     time_t secs= (time_t) tv.tv_sec;
     localtime_r(&secs, &tm_time);
 
-    char ts[32];
+    char ts[40];   /* GCC's -Wformat-truncation sizes %d against INT_MIN;
+                      the real tm_* range fits in 24 bytes, but pad the
+                      buffer instead of fighting the (harmless) warning */
     snprintf(ts, sizeof(ts), "%04d-%02d-%02d %02d:%02d:%02d.%03d",
              tm_time.tm_year + 1900, tm_time.tm_mon + 1, tm_time.tm_mday,
              tm_time.tm_hour, tm_time.tm_min, tm_time.tm_sec,
@@ -985,6 +979,15 @@ static void notify_impl(MYSQL_THD thd, unsigned int event_class,
         (const struct mysql_event_table_access *) event);
 }
 
+/*
+  Confirmed against the real (non-preprocessed) plugin_audit.h in this
+  build: st_mysql_audit::event_notify is
+  int (*)(MYSQL_THD, mysql_event_class_t, const void *) — MYSQL_THD, not
+  void*. (An earlier check against plugin_audit.h.pp, a pre-generated
+  ABI-snapshot file also present in the tree, suggested void* — that file
+  does not reflect what this header actually declares; the compiler is
+  the ground truth here, not the .pp file.)
+*/
 static int selective_trace_notify(MYSQL_THD thd,
                                   mysql_event_class_t event_class,
                                   const void *event)

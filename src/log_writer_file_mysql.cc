@@ -14,6 +14,7 @@
    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1335 USA */
 
 #include <mysql/psi/mysql_thread.h>
+#include <mysql/psi/mysql_rwlock.h>  /* mysql_thread.h does NOT pull this in */
 
 #include <cstdio>
 #include <cerrno>

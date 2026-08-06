@@ -15,20 +15,22 @@
 
 /*
   ---------------------------------------------------------------------
-  ETAPA 4 — HIGHEST RISK FILE OF THE PORT. See docs/RESEARCH_NOTES_MYSQL.md
-  and docs/DECISIONS.md before touching this file.
-
-  The service/function names used below (mysql_command_factory,
-  mysql_command_thread, mysql_command_query, mysql_command_error_info, the
-  MYSQL_H handle type, ...) follow the *architecture* that is certain —
-  every MySQL 8.0 component service is looked up by name through the
-  plugin registry and cast to its SERVICE_TYPE(...) — but the exact
-  header path, service names and function signatures were NOT confirmed
-  against a real include/mysql/components/services/mysql_command_services.h
-  in this session (no MySQL 8.0 source tree was available). Validate this
-  file in isolation (a throwaway test plugin that only tries to run
-  "SELECT 1" through it) against the real MySQL 8.0 headers before relying
-  on it. Do not skip this step.
+  ETAPA 4 — confirmed against a real MySQL 8.0.40 source tree (this repo's
+  Docker environment, see docker/Dockerfile + scripts/build.sh) on
+  2026-08-06: service names, DECLARE_BOOL_METHOD signatures and the
+  registry acquire/release pattern below were cross-checked against
+  include/mysql/components/services/mysql_command_services.h and the real
+  reference plugin plugin/test_services/test_services_command_services.cc
+  (which uses this exact service set from a plain st_mysql_plugin, not a
+  component — same situation as this file). Notably: mysql_command_thread
+  really exists (session-thread init/end for a plugin-owned background
+  thread that never went through the server's own thread machinery — our
+  exact situation), sql_errno() writes the error number through an
+  out-parameter rather than returning it, and service pointer variables
+  are typed SERVICE_TYPE_NO_CONST(name) (mutable), not SERVICE_TYPE(name)
+  (const), in that reference code — matched here. Not yet exercised at
+  runtime (that needs an actual server to INSTALL PLUGIN into — Etapa 5),
+  but the code now compiles clean against the real headers.
   ---------------------------------------------------------------------
 
   log_writer_table_mysql — TABLE output mode. Architecture mirrors the
@@ -101,13 +103,18 @@ static my_h_service h_field_info= NULL;
 static my_h_service h_error_info= NULL;
 static my_h_service h_thread= NULL;
 
-static SERVICE_TYPE(mysql_command_factory) *com_factory= NULL;
-static SERVICE_TYPE(mysql_command_options) *com_options= NULL;
-static SERVICE_TYPE(mysql_command_query) *com_query= NULL;
-static SERVICE_TYPE(mysql_command_query_result) *com_query_result= NULL;
-static SERVICE_TYPE(mysql_command_field_info) *com_field_info= NULL;
-static SERVICE_TYPE(mysql_command_error_info) *com_error_info= NULL;
-static SERVICE_TYPE(mysql_command_thread) *com_thread= NULL;
+/* SERVICE_TYPE_NO_CONST (mutable), matching
+   plugin/test_services/test_services_command_services.cc — SERVICE_TYPE
+   (const-qualified) is for callers that only ever read a cached pointer,
+   which is also what we do here, but the real reference code uses the
+   NO_CONST variant for these plugin-owned statics, so this mirrors it. */
+static SERVICE_TYPE_NO_CONST(mysql_command_factory) *com_factory= NULL;
+static SERVICE_TYPE_NO_CONST(mysql_command_options) *com_options= NULL;
+static SERVICE_TYPE_NO_CONST(mysql_command_query) *com_query= NULL;
+static SERVICE_TYPE_NO_CONST(mysql_command_query_result) *com_query_result= NULL;
+static SERVICE_TYPE_NO_CONST(mysql_command_field_info) *com_field_info= NULL;
+static SERVICE_TYPE_NO_CONST(mysql_command_error_info) *com_error_info= NULL;
+static SERVICE_TYPE_NO_CONST(mysql_command_thread) *com_thread= NULL;
 
 static MYSQL_H command_h= NULL;         /* writer thread only */
 static int services_acquired= 0;
@@ -159,16 +166,23 @@ static bool acquire_services()
     }
   }
 
-  com_factory= reinterpret_cast<SERVICE_TYPE(mysql_command_factory) *>(h_factory);
-  com_options= reinterpret_cast<SERVICE_TYPE(mysql_command_options) *>(h_options);
-  com_query= reinterpret_cast<SERVICE_TYPE(mysql_command_query) *>(h_query);
+  com_factory=
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_command_factory) *>(h_factory);
+  com_options=
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_command_options) *>(h_options);
+  com_query=
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_command_query) *>(h_query);
   com_query_result=
-    reinterpret_cast<SERVICE_TYPE(mysql_command_query_result) *>(h_query_result);
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_command_query_result) *>(
+        h_query_result);
   com_field_info=
-    reinterpret_cast<SERVICE_TYPE(mysql_command_field_info) *>(h_field_info);
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_command_field_info) *>(
+        h_field_info);
   com_error_info=
-    reinterpret_cast<SERVICE_TYPE(mysql_command_error_info) *>(h_error_info);
-  com_thread= reinterpret_cast<SERVICE_TYPE(mysql_command_thread) *>(h_thread);
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_command_error_info) *>(
+        h_error_info);
+  com_thread=
+    reinterpret_cast<SERVICE_TYPE_NO_CONST(mysql_command_thread) *>(h_thread);
 
   services_acquired= 1;
   return com_factory && com_query && com_error_info && com_thread;
@@ -215,8 +229,13 @@ static bool ensure_conn()
   {
     /* Register this OS thread with the command services runtime before
        the first init()/connect() call — analogous to my_thread_init() for
-       the mysql_real_connect_local() path in the MariaDB plugin. */
-    com_thread->init();
+       the mysql_real_connect_local() path in the MariaDB plugin.
+       mysql_command_thread::init() returns bool, true = failure. */
+    if (com_thread->init())
+    {
+      fprintf(stderr, "selective_trace: mysql_command_thread->init failed\n");
+      return false;
+    }
     command_thread_inited= 1;
   }
 
@@ -253,12 +272,17 @@ static bool ensure_conn()
   return true;
 }
 
-/* writer thread only */
+/* writer thread only. mysql_command_error_info::sql_errno() writes the
+   errno through an out-parameter and returns bool (true = failed to
+   retrieve it) — it does not return the errno value directly. */
 static unsigned int last_errno()
 {
+  unsigned int err= 0;
   if (com_error_info == NULL || command_h == NULL)
     return 0;
-  return com_error_info->sql_errno(command_h);
+  if (com_error_info->sql_errno(command_h, &err))
+    return 0;
+  return err;
 }
 
 /* writer thread only */
