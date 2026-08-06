@@ -29,7 +29,7 @@ criado como repo próprio, `core/` aqui deve virar um submodule apontando
 para ele, e o MariaDB deve passar pela mesma refatoração (fora do escopo
 deste repo). Até lá, qualquer correção ao `filter_engine` precisa ser
 replicada manualmente nos dois repos — validado nesta sessão que os testes
-batem 160/160 (157 originais + 3 novos para as funções de escape) contra
+batem 194/194 (157 originais + 37 novos — 3 de escape na sessão anterior, 34 de edge cases nesta sessão) contra
 esta cópia.
 
 ## 2. Testes: 3 casos novos para as funções de escape movidas
@@ -39,7 +39,7 @@ esta cópia.
 lado MariaDB (eram exercitadas apenas indiretamente via o plugin rodando).
 Como elas moraram para o `core` compartilhado e agora são parte da
 superfície pública testável sem precisar de um servidor, ganhar cobertura
-direta é barato e vale a pena. Total: **160 checks**, todos passando
+direta é barato e vale a pena. Total: **194 checks**, todos passando
 (validado nesta sessão com `gcc:13` via Docker — ver abaixo).
 
 ## 3. Sem `RECOMPILE_FOR_EMBEDDED` no CMakeLists
@@ -144,7 +144,7 @@ repo antes desta sessão (inconsistência corrigida a pedido do usuário).
 ## 10. Verificação feita nesta sessão
 
 - `core/test_filter_logic.cc` compilado e executado dentro de um
-  container `gcc:13` (`g++ -std=c++17 -Wall -Wextra -Werror`): **160/160
+  container `gcc:13` (`g++ -std=c++17 -Wall -Wextra -Werror`): **194/194
   checks OK**.
 - **Etapa 1 fechada na mesma sessão, em seguida**: `docker/Dockerfile` foi
   buildado, um `mysql-server` tag `mysql-8.0.40` real foi clonado
@@ -178,6 +178,32 @@ repo antes desta sessão (inconsistência corrigida a pedido do usuário).
     (fica dentro da árvore, sem precisar de `..`).
   - Todos os detalhes e o texto exato dos headers reais estão em
     `docs/RESEARCH_NOTES_MYSQL.md`.
+- **Sessão seguinte (mesmo dia): validado também contra `mysql-9.7.2`**
+  real (série mais nova, Innovation release), volumes Docker separados
+  dos do 8.0.40. Achados (detalhes em `docs/RESEARCH_NOTES_MYSQL.md`
+  "MySQL 9.x"): a Audit API em si não mudou nada que este plugin use —
+  só a toolchain de build precisou de ajuste (`scripts/build.sh` agora
+  passa `-DCMAKE_C_COMPILER`/`-DCMAKE_CXX_COMPILER` explícitos, porque o
+  CMake do MySQL 9.x exige gcc-toolset-14 por padrão e aborta com
+  `FATAL_ERROR` se não achar — a menos que o compilador já esteja
+  setado, o que pula a checagem; `gcc-toolset-12` funcionou de boa; e
+  `-DWITH_CURL=0`, porque a detecção de CURL do 9.x não aceita o
+  `libcurl-devel` do EL8). Um bug de código real também apareceu:
+  `NullS` (macro legada) não chega mais transitivamente pelos includes
+  do plugin no 9.7.2 — trocado por `nullptr`, testado limpo nas duas
+  séries depois. `scripts/build.sh --plugin` foi reexecutado nas duas
+  séries após as mudanças, ambas limpas.
+- **Testes unitários ampliados na mesma sessão**: 34 novos checks em
+  `core/test_filter_logic.cc` cobrindo lacunas reais não exercitadas
+  antes — `mask_secrets` com segredo não fechado e sem gatilho nenhum,
+  `extract_command` com `buf_size` 0/1/pequeno, merge de máscara de
+  comando entre `selective_trace_schemas` e `selective_trace_tables`
+  quando o mesmo schema aparece nas duas listas, backtick não pareado,
+  overflow de conexão além de 2^64-1. Total agora: **194/194 checks**
+  (era 160/160). Dois dos novos testes falharam na primeira tentativa
+  por um bug no próprio teste (tamanho de string hardcoded incluindo o
+  `\0` como se fosse dado) — corrigido usando `strlen()`/o helper `mask()`
+  já existente no arquivo.
 - **Ainda não exercido**: `INSTALL PLUGIN` num `mysqld` real, e qualquer
   comportamento em runtime (FILE, TABLE, filtros, `mysql_command_services`
   executando uma query de verdade). Isso é Etapa 5 — precisa de um

@@ -2,12 +2,15 @@
 # ---------------------------------------------------------------------------
 # build.sh
 #
-# Builds the MySQL 8.0 server (minimal build needed to compile plugins
-# against it) and then compiles only the plugin under src/ (+ the shared
-# core/ sources it pulls in).
+# Builds the MySQL server (minimal build needed to compile plugins against
+# it) and then compiles only the plugin under src/ (+ the shared core/
+# sources it pulls in). Validated against both MySQL 8.0.40 and MySQL
+# 9.7.2 (set MYSQL_VERSION accordingly) — see docs/RESEARCH_NOTES_MYSQL.md
+# for what differs between the two series and why the flags below exist.
 #
 # Usage:
-#   ./scripts/build.sh              # full build (first time, slower)
+#   MYSQL_VERSION=8.0.40 ./scripts/build.sh   # full build, MySQL 8.0.x
+#   MYSQL_VERSION=9.7.2  ./scripts/build.sh   # full build, MySQL 9.x
 #   ./scripts/build.sh --plugin     # recompile the plugin only (incremental)
 #   ./scripts/build.sh --package    # produce a test package (mysqld + plugin)
 #   ./scripts/build.sh --fetch      # clone the MySQL source tree only
@@ -49,10 +52,26 @@ configure_cmake() {
     echo ">> Configuring build with CMake (Ninja + ccache)"
     mkdir -p "${BUILD_DIR}"
     cd "${BUILD_DIR}"
-    # DOWNLOAD_BOOST=1 fetches the exact Boost version MySQL 8.0 needs into
-    # WITH_BOOST if it is not already cached there from a previous run.
+    # DOWNLOAD_BOOST=1 fetches the exact Boost version the target MySQL
+    # series needs into WITH_BOOST if not already cached there.
+    #
+    # -DCMAKE_C_COMPILER/-DCMAKE_CXX_COMPILER: MySQL 9.x's top-level
+    # CMakeLists.txt requires gcc-toolset-14 on EL8/EL9 and hard-errors
+    # (CMake FATAL_ERROR) if it can't find it UNLESS the compiler is
+    # already set explicitly — which skips that check entirely. Pinning
+    # to gcc-toolset-12 (this Dockerfile's toolchain) here works fine for
+    # both 8.0.x and 9.x; harmless for 8.0.x, which never required a
+    # specific toolset in the first place.
+    #
+    # -DWITH_CURL=0: MySQL 9.x's CMake CURL detection wants a newer
+    # libcurl than EL8 ships (fails with "ADD_LIBRARY cannot create ALIAS
+    # target ext::curl" otherwise). The plugin needs no HTTP functionality,
+    # so disabling it is safe. Also harmless for 8.0.x (unused cache var
+    # at worst).
     cmake "${MYSQL_SRC_DIR}" \
         -G Ninja \
+        -DCMAKE_C_COMPILER="$(command -v gcc)" \
+        -DCMAKE_CXX_COMPILER="$(command -v g++)" \
         -DCMAKE_BUILD_TYPE=RelWithDebInfo \
         -DCMAKE_C_COMPILER_LAUNCHER=ccache \
         -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
@@ -60,6 +79,7 @@ configure_cmake() {
         -DWITH_BOOST="${BOOST_DIR}" \
         -DWITH_UNIT_TESTS=OFF \
         -DWITH_ROUTER=OFF \
+        -DWITH_CURL=0 \
         -DCMAKE_CXX_STANDARD=17
 }
 

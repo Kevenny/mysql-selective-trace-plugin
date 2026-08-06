@@ -410,6 +410,177 @@ static void test_output_escaping()
   CHECK(s == "a\\'b\\\\c\\nd");
 }
 
+/* ------------------------------------------------------------------------
+   Additional edge-case coverage (added after the Etapa 1 real-header
+   build session — filling gaps that the original 157+3 checks did not
+   exercise, not padding: every case below documents a behavior contract
+   that a future change to filter_engine.cc could silently break).
+   ------------------------------------------------------------------------ */
+
+static void test_output_escaping_edge_cases()
+{
+  using selective_trace::json_escape_append;
+  using selective_trace::sql_escape_append;
+
+  /* empty input: no crash, empty output */
+  std::string j_empty;
+  json_escape_append(&j_empty, "", 0);
+  CHECK(j_empty.empty());
+  std::string s_empty;
+  sql_escape_append(&s_empty, "", 0);
+  CHECK(s_empty.empty());
+
+  /* clean input passes through byte-for-byte */
+  std::string j_clean;
+  json_escape_append(&j_clean, "hello world", 11);
+  CHECK(j_clean == "hello world");
+
+  /* DEL (0x7F) is outside JSON's mandatory-escape range (<0x20) and is
+     passed through unchanged, same as any other printable-ish byte */
+  std::string j_del;
+  char del[]= { (char) 0x7F, 0 };
+  json_escape_append(&j_del, del, 1);
+  CHECK(j_del.size() == 1 && (unsigned char) j_del[0] == 0x7F);
+
+  /* every JSON-significant control char in one pass, in order */
+  std::string j_all;
+  json_escape_append(&j_all, "\"\\\b\f\n\r\t", 7);
+  CHECK(j_all == "\\\"\\\\\\b\\f\\n\\r\\t");
+
+  /* SUB (0x1A / Ctrl-Z) is MySQL/SQL-significant (\\Z), not JSON-significant
+     (falls into the generic <0x20 \\u00XX branch there) */
+  std::string j_sub;
+  char sub[]= { (char) 0x1A, 0 };
+  json_escape_append(&j_sub, sub, 1);
+  CHECK(j_sub == "\\u001a");
+  std::string s_sub;
+  sql_escape_append(&s_sub, sub, 1);
+  CHECK(s_sub == "\\Z");
+}
+
+static void test_extract_command_edge_cases()
+{
+  using selective_trace::extract_command;
+
+  /* buf_size == 0: must not write anything (no room even for the NUL) */
+  char sentinel[4]= { 'X', 'X', 'X', 'X' };
+  extract_command("SELECT 1", 8, sentinel, 0);
+  CHECK(sentinel[0] == 'X');   /* untouched */
+
+  /* buf_size == 1: only room for the terminating NUL */
+  char one[1]= { 'X' };
+  extract_command("SELECT 1", 8, one, 1);
+  CHECK(one[0] == 0);
+
+  /* buf smaller than the keyword: truncates, still NUL-terminated */
+  char small[4];
+  extract_command("SELECT 1", 8, small, sizeof(small));
+  CHECK(std::string(small) == "SEL");
+
+  /* query that is only comments/whitespace, no keyword at all */
+  CHECK(cmd("/* just a comment */") == "OTHER");
+  CHECK(cmd("((( )))") == "OTHER");
+
+  /* keyword immediately followed by end-of-string (no trailing space) */
+  CHECK(cmd("COMMIT") == "COMMIT");
+}
+
+static void test_mask_secrets_edge_cases()
+{
+  using selective_trace::mask_secrets;
+
+  /* IDENTIFIED with no connector and no literal at all: nothing to mask,
+     query passed through unchanged, mask_secrets() reports false */
+  const char *q1= "CREATE USER x IDENTIFIED";
+  std::string out1;
+  bool masked1= mask_secrets(q1, std::strlen(q1), &out1);
+  CHECK(!masked1);
+  CHECK(out1 == q1);
+
+  /* unterminated quoted secret: the value is masked (truncated, not
+     reproduced) rather than left unescaped or crashing */
+  CHECK(mask("IDENTIFIED BY 'never closes") ==
+        "IDENTIFIED BY '***");   /* no closing quote emitted */
+
+  /* PASSWORD keyword with nothing following it at all */
+  const char *q3= "SET PASSWORD";
+  std::string out3;
+  bool masked3= mask_secrets(q3, std::strlen(q3), &out3);
+  CHECK(!masked3);
+  CHECK(out3 == q3);
+
+  /* two independent triggers in one statement, both masked */
+  CHECK(mask("SET PASSWORD = 'a', PASSWORD = 'b'") ==
+        "SET PASSWORD = '***', PASSWORD = '***'");
+}
+
+static void test_filter_cross_list_merge()
+{
+  /* the same schema listed both explicitly (selective_trace_schemas) and
+     via a schema.* wildcard (selective_trace_tables) must have its
+     command masks unioned across both lists when matching */
+  FilterRules r;
+  std::string err;
+  CHECK(selective_trace::parse_filter_lists("app:select", "app.*:insert",
+                                            &r, &err));
+  CHECK(selective_trace::match_schema(r, "app", 3) ==
+        (selective_trace::CMD_SELECT | selective_trace::CMD_INSERT));
+
+  /* a table covered by both a wildcard entry and its own specific entry
+     gets the union of both masks; a sibling table only gets the
+     wildcard's mask */
+  FilterRules r2;
+  CHECK(selective_trace::parse_filter_lists(
+      "", "logs.*:select, logs.important:insert", &r2, &err));
+  CHECK(selective_trace::match_table(r2, "logs", 4, "important", 9) ==
+        (selective_trace::CMD_SELECT | selective_trace::CMD_INSERT));
+  CHECK(selective_trace::match_table(r2, "logs", 4, "other", 5) ==
+        selective_trace::CMD_SELECT);
+
+  /* "*" as a literal schema NAME (no dot at all) is not a wildcard —
+     wildcard semantics only apply to "schema.*" table entries */
+  FilterRules r3;
+  CHECK(selective_trace::parse_filter_lists("*", "", &r3, &err));
+  CHECK(selective_trace::match_schema(r3, "*", 1));
+  CHECK(!selective_trace::match_schema(r3, "anything", 8));
+}
+
+static void test_backtick_edge_cases()
+{
+  FilterRules r;
+  std::string err;
+
+  /* a single, unmatched backtick is not stripped (strip_ticks only acts
+     on a pair: first AND last char both '`') — it stays part of the
+     literal (lowercased) identifier and must be matched verbatim */
+  CHECK(selective_trace::parse_filter_lists("`odd", "", &r, &err));
+  CHECK(selective_trace::match_schema(r, "`odd", 4));
+  CHECK(!selective_trace::match_schema(r, "odd", 3));
+}
+
+static void test_connection_list_edge_cases()
+{
+  using selective_trace::parse_connection_list;
+  using selective_trace::match_connection;
+
+  FilterRules r;
+  std::string err;
+
+  /* a token that is pure whitespace between commas is trimmed to empty
+     and ignored, same as a genuinely empty token */
+  CHECK(parse_connection_list("1,   ,2", &r, &err));
+  CHECK(r.connections.size() == 2);
+
+  /* decimal literal beyond 2^64-1: every character is still a valid
+     digit, so parsing does not fail — the accumulator wraps per normal
+     unsigned overflow semantics. Documented contract: parse_connection_list
+     validates *character set*, not numeric range. */
+  FilterRules r2;
+  bool ok= parse_connection_list("99999999999999999999", &r2, &err);
+  CHECK(ok);
+  CHECK(r2.connections.size() == 1);
+}
+
 int main()
 {
   test_empty_lists();
@@ -424,6 +595,12 @@ int main()
   test_connection_filter();
   test_match_null_safety();
   test_output_escaping();
+  test_output_escaping_edge_cases();
+  test_extract_command_edge_cases();
+  test_mask_secrets_edge_cases();
+  test_filter_cross_list_merge();
+  test_backtick_edge_cases();
+  test_connection_list_edge_cases();
 
   if (failures)
   {

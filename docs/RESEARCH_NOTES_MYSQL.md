@@ -1,17 +1,63 @@
 # RESEARCH_NOTES_MYSQL.md — Etapa 0 / Etapa 1
 
-Notas de pesquisa da Audit API do MySQL 8.0, para o porte do
+Notas de pesquisa da Audit API do MySQL 8.0/9.x, para o porte do
 `selective_trace`.
 
-**Status: Etapa 1 fechada em 2026-08-06.** `src/` compila e linka limpo
-(zero warnings) contra um checkout real de `mysql-server` tag
-`mysql-8.0.40`, via `docker/Dockerfile` + `scripts/build.sh` — os três
-comandos documentados (`full`/`--plugin`/`--package`) foram executados de
-ponta a ponta com sucesso, e `selective_trace.so` exporta os símbolos
-esperados (`_mysql_plugin_declarations_`, `_mysql_plugin_interface_version_`)
-para um plugin `MYSQL_DYNAMIC_PLUGIN`. **Não validado ainda**: `INSTALL
-PLUGIN` num `mysqld` rodando de verdade, nem qualquer exercício funcional
-(FILE, TABLE, filtros) — isso é Etapa 5, precisa de um servidor de pé.
+**Status: Etapa 1 fechada em 2026-08-06 — validada contra DUAS séries do
+MySQL.** `src/` compila e linka limpo (zero warnings) contra checkouts
+reais de:
+
+- `mysql-server` tag **`mysql-8.0.40`**
+- `mysql-server` tag **`mysql-9.7.2`**
+
+via `docker/Dockerfile` + `scripts/build.sh` (parametrizado por
+`MYSQL_VERSION`) — os comandos documentados (`full`/`--plugin`/`--package`)
+foram executados de ponta a ponta com sucesso nas duas séries, e
+`selective_trace.so` exporta os símbolos esperados
+(`_mysql_plugin_declarations_`, `_mysql_plugin_interface_version_`) para
+um plugin `MYSQL_DYNAMIC_PLUGIN` em ambas. **Não validado ainda**:
+`INSTALL PLUGIN` num `mysqld` rodando de verdade, nem qualquer exercício
+funcional (FILE, TABLE, filtros) — isso é Etapa 5, precisa de um servidor
+de pé, em qualquer das duas séries.
+
+## MySQL 9.x — o que muda em relação ao 8.0 (achados desta sessão)
+
+MySQL 9.x (testado com 9.7.2) compartilha a Audit API do 8.0 no que este
+plugin usa (mesma `MYSQL_AUDIT_INTERFACE_VERSION 0x0401`, mesmos structs
+de evento, mesmas macros de sysvar) — nenhuma mudança de código foi
+necessária nesse nível. As diferenças encontradas foram todas na
+**toolchain de build**, não na Audit API:
+
+- **Exige C++23** (`-std=gnu++23` no log de build), não C++17/20 como o
+  8.0. Não afetou o código deste plugin (escrito em C++17 puro, um
+  subconjunto válido), mas é bom saber caso alguma mudança futura use algo
+  que o C++23 trate diferente (ex.: `char8_t`, comparações de ponteiro).
+- **Exige gcc-toolset-14** em EL8/EL9 por padrão — o CMake de nível
+  superior do MySQL 9.x tem uma checagem (`CMakeLists.txt` linha ~311)
+  que aborta com `FATAL_ERROR` se não achar um devtoolset compatível,
+  **a menos que `CMAKE_C_COMPILER`/`CMAKE_CXX_COMPILER` já estejam
+  definidos explicitamente** — nesse caso a checagem é pulada
+  inteiramente. `scripts/build.sh` agora sempre passa esses dois
+  explicitamente (apontando para o gcc-toolset-12 deste Dockerfile),
+  contornando a exigência do 14 — compilar com um toolset mais antigo
+  que o "oficialmente recomendado" funcionou sem problema aqui.
+- **Detecção de CURL mais estrita** — o `WITH_CURL=system` (padrão) do
+  MySQL 9.x falha no CMake (`ADD_LIBRARY cannot create ALIAS target
+  "ext::curl"`) contra o `libcurl-devel` do EL8, que é antigo demais.
+  Como o plugin não usa nada de HTTP, `-DWITH_CURL=0` resolve e é inócuo
+  também no 8.0.x.
+- **`NullS` não é mais alcançado transitivamente** pelos includes deste
+  plugin (`<mysql/plugin.h>` e cia.) — no 8.0 chegava de algum header
+  puxado indiretamente; no 9.7.2 não chega, e o build falhou com `'NullS'
+  was not declared in this scope`. Trocado por `nullptr` em
+  `selective_trace_mysql.cc` (mais portável, não depende de nenhum
+  include extra) — funciona igual nas duas séries.
+
+Essas descobertas foram incorporadas em `scripts/build.sh`
+(`configure_cmake()`), que agora passa `-DCMAKE_C_COMPILER`,
+`-DCMAKE_CXX_COMPILER` e `-DWITH_CURL=0` incondicionalmente — confirmado
+inócuo no 8.0.40 (reexecutado depois da mudança, `--plugin` continua
+limpo).
 
 ## Confirmado contra os headers reais (dois momentos de pesquisa)
 
@@ -130,8 +176,13 @@ grepado diretamente dentro do container):
 
 ## Como reproduzir a validação de build desta sessão
 
+Funciona igual para as duas séries — só troca `MYSQL_VERSION` e o nome
+dos volumes (para não misturar cache de fontes/build entre 8.0 e 9.x):
+
 ```bash
 docker build -t selective-trace-mysql-dev -f docker/Dockerfile docker/
+
+# --- MySQL 8.0.40 ---
 docker volume create mysql-plugin-src   # cache do clone (~vários GB)
 docker volume create mysql-plugin-build
 docker volume create mysql-plugin-boost
@@ -139,6 +190,7 @@ docker volume create mysql-plugin-ccache
 docker run --rm -v "$PWD:/workspace" \
   -v mysql-plugin-src:/opt/mysql-src -v mysql-plugin-build:/opt/mysql-build \
   -v mysql-plugin-boost:/opt/boost -v mysql-plugin-ccache:/opt/ccache \
+  -e MYSQL_VERSION=8.0.40 \
   -e MYSQL_SRC_DIR=/opt/mysql-src -e BUILD_DIR=/opt/mysql-build \
   -e BOOST_DIR=/opt/boost -e CCACHE_DIR=/opt/ccache \
   -w /workspace --user root selective-trace-mysql-dev bash -lc '
@@ -147,12 +199,29 @@ docker run --rm -v "$PWD:/workspace" \
     ./scripts/build.sh full      # primeira vez: clona + configura + build completo
     ./scripts/build.sh --plugin  # depois: só recompila o plugin
     ./scripts/build.sh --package'
+
+# --- MySQL 9.7.2 (volumes separados, mesmo procedimento) ---
+docker volume create mysql9-plugin-src
+docker volume create mysql9-plugin-build
+docker volume create mysql9-plugin-boost
+docker volume create mysql9-plugin-ccache
+docker run --rm -v "$PWD:/workspace" \
+  -v mysql9-plugin-src:/opt/mysql9-src -v mysql9-plugin-build:/opt/mysql9-build \
+  -v mysql9-plugin-boost:/opt/mysql9-boost -v mysql9-plugin-ccache:/opt/ccache \
+  -e MYSQL_VERSION=9.7.2 \
+  -e MYSQL_SRC_DIR=/opt/mysql9-src -e BUILD_DIR=/opt/mysql9-build \
+  -e BOOST_DIR=/opt/mysql9-boost -e CCACHE_DIR=/opt/ccache \
+  -w /workspace --user root selective-trace-mysql-dev bash -lc '
+    export PATH="/opt/rh/gcc-toolset-12/root/usr/bin:${PATH}"
+    git config --global --add safe.directory /opt/mysql9-src
+    ./scripts/build.sh full && ./scripts/build.sh --package'
 ```
 
 ## Próximos passos (Etapa 5)
 
-1. Subir um `mysqld` 8.0.40 oficial (container separado), copiar o `.so`
-   de `build/plugin_output/` para o `plugin_dir`, `INSTALL PLUGIN`.
+1. Subir um `mysqld` 8.0.40 (e depois 9.7.2) oficial em container
+   separado, copiar o `.so` de `build/plugin_output/` para o
+   `plugin_dir`, `INSTALL PLUGIN`.
 2. Bateria funcional: `selective_trace_schemas`/`_tables`/`_connections`,
    FILE (JSON válido), TABLE (`mysql.selective_trace_events` criada e
    populada, sem loop de auto-log), `min_duration_ms`, `mask_passwords`.

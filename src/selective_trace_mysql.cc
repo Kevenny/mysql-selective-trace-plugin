@@ -209,7 +209,14 @@ static bool opt_mask_passwords= true;
 #define SELECTIVE_TRACE_OUTPUT_FILE  0
 #define SELECTIVE_TRACE_OUTPUT_TABLE 1
 
-static const char *output_names[]= { "FILE", "TABLE", NullS };
+/*
+  nullptr, not the legacy NullS macro: NullS (from my_sys.h in MariaDB /
+  MySQL 8.0) is not transitively pulled in by this file's includes on
+  MySQL 9.x — confirmed by compiling against a real mysql-9.7.2 tree,
+  where this line failed with "'NullS' was not declared in this scope".
+  nullptr needs no extra include and works identically here.
+*/
+static const char *output_names[]= { "FILE", "TABLE", nullptr };
 static TYPELIB output_typelib=
 {
   array_elements(output_names) - 1, "", output_names, NULL
