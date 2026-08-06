@@ -3,6 +3,8 @@ build/
 *.so
 *.o
 *.obj
+*.exe
+core/test_filter_logic
 CMakeCache.txt
 CMakeFiles/
 cmake_install.cmake
