@@ -263,8 +263,25 @@ static bool ensure_conn()
     return false;
   }
 
+  /*
+    SECURITY: this MUST be fatal, not just logged. sql_escape_append()'s
+    backslash escaping is only effective when NO_BACKSLASH_ESCAPES is off
+    for this session. If the SET fails and the ambient sql_mode (inherited
+    from GLOBAL) has NO_BACKSLASH_ESCAPES on, escaping silently becomes a
+    no-op and any traced query text containing a bare "'" would break out
+    of the INSERT's string literal — SQL injection running with the
+    internal writer connection's privileges. Refuse to insert rather than
+    insert unsafely.
+  */
   if (com_query->query(command_h, set_mode, sizeof(set_mode) - 1))
-    fprintf(stderr, "selective_trace: could not set writer sql_mode\n");
+  {
+    fprintf(stderr,
+            "selective_trace: could not set writer sql_mode — refusing to"
+            " insert (would risk SQL injection via unescaped ' in traced"
+            " query text)\n");
+    close_conn();
+    return false;
+  }
   if (com_query->query(command_h, CREATE_LOG_TABLE_SQL,
                        sizeof(CREATE_LOG_TABLE_SQL) - 1))
     fprintf(stderr, "selective_trace: could not create " LOG_TABLE_FQN "\n");

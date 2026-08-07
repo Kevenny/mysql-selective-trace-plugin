@@ -76,13 +76,13 @@ sem passar pela rede. O MySQL 8.0 não expõe esse atalho a plugins comuns;
 o mecanismo suportado desde a 8.0.24 é o serviço de componente
 `mysql_command_services`, adquirido via `mysql_plugin_registry_acquire()`.
 
-Esse é o pedaço de **maior risco técnico** do porte (CLAUDE.md §10.1) — os
-nomes exatos de serviço/função usados em
-`src/log_writer_table_mysql.cc` seguem a arquitetura certa (todo serviço
-de componente MySQL 8.0 é resolvido por nome, sem exceção) mas não foram
-confirmados contra um header real nesta sessão (sem árvore de fontes do
-MySQL disponível). Ver `docs/RESEARCH_NOTES_MYSQL.md` item 3 para o plano
-de validação da Etapa 4.
+Esse era o pedaço de **maior risco técnico** do porte (CLAUDE.md §10.1) —
+os nomes exatos de serviço/função usados em `src/log_writer_table_mysql.cc`
+foram confirmados em sessão posterior contra um `mysql-server` real
+(8.0.40 e 9.7.2), compilando limpo nas duas séries. Ver
+`docs/RESEARCH_NOTES_MYSQL.md`. **Falta ainda** o exercício em runtime
+(uma query de verdade passando pelo writer contra um `mysqld` de pé) —
+Etapa 5.
 
 ## 6. Sem `query_id` do servidor — contador local por conexão
 
@@ -208,3 +208,32 @@ repo antes desta sessão (inconsistência corrigida a pedido do usuário).
   comportamento em runtime (FILE, TABLE, filtros, `mysql_command_services`
   executando uma query de verdade). Isso é Etapa 5 — precisa de um
   servidor de pé, não só compilar.
+
+## 11. Injeção SQL corrigida — falha ao pinar `sql_mode` agora é fatal
+
+Revisão de segurança nesta sessão encontrou uma vulnerabilidade real (não
+teórica) em `src/log_writer_table_mysql.cc`, herdada do mesmo padrão do
+plugin MariaDB (`log_writer_table.cc` tem o código idêntico).
+
+O writer TABLE monta o `INSERT` concatenando texto escapado via
+`sql_escape_append()` (escape por barra invertida — `'` → `\'`). Esse
+escape só é seguro se a sessão não tiver `NO_BACKSLASH_ESCAPES` no
+`sql_mode` (parte do modo `ANSI`, usado em instalações "hardened" — não é
+cenário exótico). O código já tentava neutralizar isso com
+`SET SESSION sql_mode=''` antes de qualquer INSERT, mas **ignorava o
+retorno** dessa query: se falhasse, só logava um aviso e seguia inserindo
+mesmo assim. Se o `sql_mode` global tivesse `NO_BACKSLASH_ESCAPES` (ou o
+`SET` falhasse por qualquer motivo transitório), qualquer usuário cuja
+query fosse rastreada pelo filtro podia incluir um `'` desacompanhado no
+texto da própria query, que sobrevivia ao escape sem neutralização e
+quebrava a string literal do `INSERT` — injeção SQL rodando com o
+privilégio da conexão interna do writer (não do usuário que originou a
+query), potencialmente elevado já que a conexão não define
+`MYSQL_COMMAND_USER_NAME` explicitamente.
+
+**Fix**: `ensure_conn()` agora trata a falha do `SET SESSION sql_mode=''`
+como fatal — fecha a conexão e retorna `false`, e o INSERT correspondente
+é contado como falha/drop em vez de ser executado com o `sql_mode`
+potencialmente inseguro. Recompilado e validado limpo contra MySQL
+8.0.40 e 9.7.2 depois do fix. O mesmo furo continua presente no plugin
+MariaDB irmão (fora do escopo deste repo corrigir).
