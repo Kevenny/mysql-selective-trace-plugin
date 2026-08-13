@@ -5,11 +5,15 @@ Selective query trace plugin for **MySQL 8.0.24+** (needs the
 note below) that logs only queries touching the configured
 schemas/tables — a low-overhead, partial alternative to `general_log`.
 
-> **Status**: this build has not yet been compiled or run against a real
-> MySQL 8.0 server (no MySQL source tree was available in the session that
-> wrote it — see `docs/RESEARCH_NOTES_MYSQL.md`). Everything below
-> describes the *intended* behavior once Etapa 1 (build) and Etapa 5
-> (validation) are done. Do not treat this as a validated guide yet.
+> **Status**: `INSTALL PLUGIN`, FILE mode and TABLE mode have all been
+> exercised end to end against a real `mysqld` 8.0.40 in Docker (Etapa 5,
+> in progress). Filtering by schema, `min_duration_ms`, `mask_passwords`
+> and connection identity have **not** been individually re-verified yet
+> in that same session — treat those as documented-but-not-yet-drilled.
+> See `docs/RESEARCH_NOTES_MYSQL.md` "Etapa 5" for exactly what was run
+> and what's still open. §1 below has a **mandatory** extra `GRANT` step
+> for TABLE mode that earlier versions of this doc did not have — do not
+> skip it.
 
 ---
 
@@ -54,6 +58,35 @@ plugin_load_add=selective_trace.so
 ```
 
 Uninstall with `UNINSTALL PLUGIN selective_trace;`.
+
+### 1.1 Required grant for TABLE mode (`selective_trace_output = 'TABLE'`)
+
+The TABLE writer runs its `INSERT`s (and the initial `CREATE TABLE IF NOT
+EXISTS`) through MySQL's `mysql_command_services` component. That internal
+connection authenticates as the built-in **`mysql.session`@`localhost`**
+system account — confirmed live (Etapa 5): even though that account
+already carries `SUPER`, it still does **not** have `CREATE`/`INSERT` on
+an arbitrary table by default, and the writer's first `CREATE TABLE`
+silently fails (logged to the server's error log as `selective_trace:
+could not create mysql.selective_trace_events (errno ...)`) until this
+grant is in place:
+
+```sql
+GRANT CREATE, INSERT, SELECT ON mysql.selective_trace_events
+  TO 'mysql.session'@'localhost';
+FLUSH PRIVILEGES;
+```
+
+Run this **once**, as an account with `GRANT OPTION`, before the first
+`INSTALL PLUGIN` (or before the first `SET GLOBAL selective_trace_output
+= 'TABLE'` if the plugin is already loaded) — the writer's internal
+connection is established once and reused, so a grant added *after* the
+writer already gave up on creating the table won't take effect until the
+plugin is reloaded (`UNINSTALL`/`INSTALL PLUGIN` again, or restart the
+server). Table-level privileges on a not-yet-existing table are valid in
+MySQL (stored pending in `mysql.tables_priv`), so granting before the
+table exists works fine. FILE mode needs no such grant — it never talks
+to the server as a client.
 
 ## 2. Enabling and configuring
 

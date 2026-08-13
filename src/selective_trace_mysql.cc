@@ -71,6 +71,7 @@
 
 #include <new>
 #include <string>
+#include <unordered_map>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -109,31 +110,44 @@ static PSI_rwlock_info rwlock_key_list[]=
 /* ------------------------------------------------------------------------
    Per-connection statement state
 
-   Same technique as the MariaDB plugin (and MySQL's own server_audit-
-   style plugins): a hidden THDVAR string variable whose default value is
-   a NUL-free blob the server strdup()s once per connection, giving us a
-   per-THD POD buffer that is freed automatically with the THD
-   (PLUGIN_VAR_MEMALLOC). The magic field detects the pristine 'O'-filled
-   copy and triggers initialization.
+   *** HISTORY — read before touching this block ***
+   The first version of this file used the same technique as the MariaDB
+   plugin: a hidden MYSQL_THDVAR_STR whose default value is a NUL-free
+   blob the server strdup()s once per connection (PLUGIN_VAR_MEMALLOC),
+   giving a per-THD POD buffer freed automatically with the THD. That
+   trick does **not** work the same way on MySQL 8.0/9.x: confirmed live
+   against a real mysqld 8.0.40 (Docker, INSTALL PLUGIN, then
+   SET GLOBAL selective_trace_enabled=ON) — THDVAR(thd, state) returned an
+   invalid pointer and the very first dereference (st->magic) crashed the
+   server with SIGSEGV inside get_state(), reproducibly, on the first
+   audited event of the session. Root cause not fully chased into the
+   server's own sysvar internals (plausible candidates: PLUGIN_VAR_NOSYSVAR
+   THDVARs may not get the per-THD strdup() at all in this server series;
+   or a ~4 KB default value is treated differently than MariaDB's shorter
+   equivalents) — the fix does not depend on knowing which.
 
-   *** NOT YET VALIDATED against a real MySQL 8.0 server (Etapa 0/1 —
-   see docs/RESEARCH_NOTES_MYSQL.md). MYSQL_THDVAR_STR's init/alloc
-   semantics are confirmed to exist as the same macro name in MySQL's
-   plugin.h, but whether the "pristine blob" trick behaves identically
-   (in particular: is the default value string strdup()'d verbatim,
-   including embedded structure padding, exactly once per connection,
-   before the first SET/GET) must be confirmed empirically before this
-   is trusted in production. ***
+   Replacement design: per-connection state lives in a plain
+   std::unordered_map<MYSQL_THD, StatementState> guarded by a dedicated
+   rwlock (state_map_lock), fully owned and managed by this plugin instead
+   of borrowed from a server mechanism whose semantics differ by version.
+   std::unordered_map guarantees pointer/reference stability for existing
+   elements across inserts/rehashes (only erasing the element itself
+   invalidates its pointer — cppreference, unordered_map complexity
+   guarantees), so get_state() can hand back a raw StatementState* that
+   stays valid for the rest of that event's processing without holding
+   the lock throughout. Entries are created lazily on first use and
+   erased on MYSQL_AUDIT_CONNECTION_DISCONNECT (see notify_impl below).
+   A connection that never raises a clean DISCONNECT event (e.g. killed
+   mid-network-failure) leaks one ~4 KB entry — accepted as far better
+   than the alternative of crashing the server on every session.
    ------------------------------------------------------------------------ */
 
-#define STATE_MAGIC 0x53454C4D          /* "SELM" */
 #define STATE_TABLES_BUF 3968
 #define STATE_CURRENT_DB_BUF 192        /* NAME_LEN in MySQL is 64*4+1;
                                             generous margin, not exact */
 
 struct StatementState
 {
-  unsigned int magic;
   unsigned long long local_seq;         /* connection-local statement
                                             counter — NOT the server's
                                             internal query id (MySQL's
@@ -154,35 +168,59 @@ struct StatementState
      NOT reset by state_begin_statement(). */
   unsigned int current_db_len;
   char current_db[STATE_CURRENT_DB_BUF];
+
+  /* std::unordered_map value-initializes this on first insertion
+     ("T()" — zero-initializes every member since StatementState has no
+     user-provided constructor), so a freshly created entry always starts
+     all-zero without needing a separate "pristine" sentinel/magic check. */
 };
 
-/*
-  The default blob must be NUL-free BEFORE the server registers the
-  sysvars and strdup()s it (that happens before init() runs), hence the
-  shared-library constructor.
-*/
-static char state_init_value[sizeof(struct StatementState) + 1];
+static mysql_rwlock_t state_map_lock;
+static std::unordered_map<MYSQL_THD, StatementState> *state_map= NULL;
 
-static void __attribute__((constructor)) selective_trace_so_init(void)
+#ifdef HAVE_PSI_INTERFACE
+static PSI_rwlock_key key_rwlock_state_map;
+static PSI_rwlock_info state_map_rwlock_list[]=
 {
-  memset(state_init_value, 'O', sizeof(state_init_value) - 1);
-  state_init_value[sizeof(state_init_value) - 1]= 0;
-}
-
-static MYSQL_THDVAR_STR(state,
-    PLUGIN_VAR_NOSYSVAR | PLUGIN_VAR_NOCMDOPT | PLUGIN_VAR_MEMALLOC,
-    "selective_trace internal per-connection state", NULL, NULL,
-    state_init_value);
+  { &key_rwlock_state_map, "selective_trace::state_map_lock", 0, 0,
+    PSI_DOCUMENT_ME }
+};
+#else
+#define key_rwlock_state_map 0
+#endif
 
 static StatementState *get_state(MYSQL_THD thd)
 {
-  StatementState *st= (StatementState *) THDVAR(thd, state);
-  if (st->magic != STATE_MAGIC)
+  mysql_rwlock_rdlock(&state_map_lock);
+  auto it= state_map->find(thd);
+  if (it != state_map->end())
   {
-    memset(st, 0, sizeof(*st));
-    st->magic= STATE_MAGIC;
+    StatementState *st= &it->second;
+    mysql_rwlock_unlock(&state_map_lock);
+    return st;
   }
+  mysql_rwlock_unlock(&state_map_lock);
+
+  /* First event ever seen for this THD: upgrade to the write lock and
+     insert. A given THD's events are only ever produced by the one
+     connection thread executing its statements (never concurrently from
+     two threads for the same THD), so there is no lost-update race here
+     — the write lock only protects the map's internal structure against
+     other connections' concurrent inserts/finds. */
+  mysql_rwlock_wrlock(&state_map_lock);
+  StatementState *st= &(*state_map)[thd];
+  mysql_rwlock_unlock(&state_map_lock);
   return st;
+}
+
+/* Runs for every CONNECTION_CLASS/DISCONNECT event, regardless of
+   selective_trace_enabled — cheap, and avoids leaking an entry for every
+   connection that happens to disconnect while tracing is toggled off. */
+static void forget_state(MYSQL_THD thd)
+{
+  mysql_rwlock_wrlock(&state_map_lock);
+  state_map->erase(thd);
+  mysql_rwlock_unlock(&state_map_lock);
 }
 
 static unsigned long long now_ns()
@@ -469,7 +507,6 @@ static SYS_VAR *selective_trace_sysvars[]=
   MYSQL_SYSVAR(log_file_path),
   MYSQL_SYSVAR(min_duration_ms),
   MYSQL_SYSVAR(mask_passwords),
-  MYSQL_SYSVAR(state),
   NULL
 };
 
@@ -999,7 +1036,7 @@ static int selective_trace_notify(MYSQL_THD thd,
                                   mysql_event_class_t event_class,
                                   const void *event)
 {
-  if (!opt_enabled || !plugin_ready || thd == NULL)
+  if (!plugin_ready || thd == NULL)
     return 0;
 
   /* Never log the internal writer's own INSERTs (self-log loop). */
@@ -1011,6 +1048,21 @@ static int selective_trace_notify(MYSQL_THD thd,
      abort mysqld. Drop the event and count it instead. */
   try
   {
+    /* Connection cleanup runs regardless of selective_trace_enabled, so
+       toggling tracing off never leaks a state_map entry for a
+       connection that disconnects while it's off. */
+    if (event_class == MYSQL_AUDIT_CONNECTION_CLASS)
+    {
+      const struct mysql_event_connection *ev=
+        (const struct mysql_event_connection *) event;
+      if (ev->event_subclass == MYSQL_AUDIT_CONNECTION_DISCONNECT)
+        forget_state(thd);
+      return 0;
+    }
+
+    if (!opt_enabled)
+      return 0;
+
     notify_impl(thd, (unsigned int) event_class, event);
   }
   catch (...)
@@ -1028,6 +1080,7 @@ static void register_filter_psi()
 {
 #ifdef HAVE_PSI_INTERFACE
   mysql_rwlock_register("selective_trace", rwlock_key_list, 1);
+  mysql_rwlock_register("selective_trace", state_map_rwlock_list, 1);
 #endif
 }
 
@@ -1035,6 +1088,14 @@ static int selective_trace_init(MYSQL_PLUGIN arg __attribute__((unused)))
 {
   register_filter_psi();
   mysql_rwlock_init(key_rwlock_filter, &filter_lock);
+  mysql_rwlock_init(key_rwlock_state_map, &state_map_lock);
+  state_map= new (std::nothrow) std::unordered_map<MYSQL_THD, StatementState>();
+  if (state_map == NULL)
+  {
+    mysql_rwlock_destroy(&state_map_lock);
+    mysql_rwlock_destroy(&filter_lock);
+    return 1;
+  }
   selective_trace::file_writer_init();
   selective_trace::table_writer_init();
 
@@ -1074,6 +1135,9 @@ fail:
   schemas_storage= tables_storage= connections_storage= file_path_storage= NULL;
   selective_trace::table_writer_shutdown();
   selective_trace::file_writer_deinit();
+  delete state_map;
+  state_map= NULL;
+  mysql_rwlock_destroy(&state_map_lock);
   mysql_rwlock_destroy(&filter_lock);
   return 1;
 }
@@ -1094,7 +1158,10 @@ static int selective_trace_deinit(MYSQL_PLUGIN arg __attribute__((unused)))
   delete connections_storage;
   delete file_path_storage;
   schemas_storage= tables_storage= connections_storage= file_path_storage= NULL;
+  delete state_map;
+  state_map= NULL;
 
+  mysql_rwlock_destroy(&state_map_lock);
   mysql_rwlock_destroy(&filter_lock);
   fprintf(stderr, "selective_trace: plugin stopped\n");
   return 0;
@@ -1103,26 +1170,15 @@ static int selective_trace_deinit(MYSQL_PLUGIN arg __attribute__((unused)))
 /* ------------------------------------------------------------------------
    Plugin declaration
 
-   *** UNCONFIRMED STRUCT LAYOUT — validate before Etapa 1 sign-off ***
-   The class_mask array below is positional, one slot per audit class in
-   the enum order confirmed in CLAUDE.md section 2.1 (GENERAL=0,
-   CONNECTION=1, PARSE=2, AUTHORIZATION=3, TABLE_ACCESS=4,
-   GLOBAL_VARIABLE=5, SERVER_STARTUP=6, SERVER_SHUTDOWN=7, COMMAND=8,
-   QUERY=9, STORED_PROGRAM=10, AUTHENTICATION=11, MESSAGE=12) — 13 slots.
-   This positional-array shape is standard across every MySQL 8.0 audit
-   plugin (mirrors plugin/audit_null/audit_null.cc), but was not
-   re-verified against this repo's actual plugin_audit.h in this session.
-
-   mysql_declare_plugin's st_mysql_plugin struct gained a
-   `check_uninstall` callback and a trailing `flags` field at some point
-   in the MySQL 8.0 series (after the fields the MariaDB plugin uses).
-   check_uninstall is included below as NULL, in the position believed
-   correct (between init and deinit) — CONFIRM THIS against the real
-   include/mysql/plugin.h before the first build; if the field is absent,
-   or in a different position, this initializer will build a mis-wired
-   descriptor that fails at PLUGIN load or worse. This is exactly the
-   kind of thing Etapa 1 ("INSTALL PLUGIN / SHOW PLUGINS num MySQL 8.0
-   oficial") exists to catch — do not skip it.
+   class_mask is positional, one slot per audit class in the enum order
+   confirmed in CLAUDE.md section 2.1 (GENERAL=0, CONNECTION=1, PARSE=2,
+   AUTHORIZATION=3, TABLE_ACCESS=4, GLOBAL_VARIABLE=5, SERVER_STARTUP=6,
+   SERVER_SHUTDOWN=7, COMMAND=8, QUERY=9, STORED_PROGRAM=10,
+   AUTHENTICATION=11, MESSAGE=12) — 13 slots. The st_mysql_plugin struct
+   layout (14 fields incl. check_uninstall between init and deinit, and a
+   trailing flags field) and this whole descriptor were confirmed working
+   by loading the compiled .so into a real mysqld 8.0.40 via
+   INSTALL PLUGIN / SHOW PLUGINS (Etapa 5, Docker) — it comes up ACTIVE.
    ------------------------------------------------------------------------ */
 
 static struct st_mysql_audit selective_trace_descriptor=
@@ -1133,7 +1189,9 @@ static struct st_mysql_audit selective_trace_descriptor=
   {
     (unsigned long) (MYSQL_AUDIT_GENERAL_LOG | MYSQL_AUDIT_GENERAL_STATUS),
                                                     /* GENERAL_CLASS      */
-    0,                                              /* CONNECTION_CLASS   */
+    (unsigned long) MYSQL_AUDIT_CONNECTION_DISCONNECT,
+                                                    /* CONNECTION_CLASS —
+                                                       state_map cleanup */
     0,                                              /* PARSE_CLASS        */
     0,                                              /* AUTHORIZATION_CLASS*/
     (unsigned long) (MYSQL_AUDIT_TABLE_ACCESS_READ |

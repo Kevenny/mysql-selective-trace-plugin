@@ -1,7 +1,119 @@
-# RESEARCH_NOTES_MYSQL.md — Etapa 0 / Etapa 1
+# RESEARCH_NOTES_MYSQL.md — Etapa 0 / Etapa 1 / Etapa 5
 
 Notas de pesquisa da Audit API do MySQL 8.0/9.x, para o porte do
 `selective_trace`.
+
+## Etapa 5 (2026-08-13) — primeira validação em runtime, achados críticos
+
+Subimos um `mysqld` 8.0.40 oficial (container Docker isolado,
+`selective-trace-mysql8-test`), instalamos o plugin de verdade e batemos
+em dois problemas reais — nenhum dos dois era visível por inspeção nem
+pelos 194 testes unitários (que só cobrem `core/`, sem tocar servidor):
+
+### 5.1 — Crash de segurança: `INSTALL PLUGIN` + `SET GLOBAL
+selective_trace_enabled=ON` derrubava o `mysqld` (SIGSEGV)
+
+Reproduzido de forma 100% consistente: `INSTALL PLUGIN` sozinho não
+derrubava nada (o plugin só fica `ACTIVE`, sem processar eventos
+enquanto `enabled=OFF`); a primeira `SET GLOBAL
+selective_trace_enabled=ON` — ou qualquer primeiro evento processado daí
+em diante — sempre crashava. Stack trace do `mysqld`:
+
+```
+/usr/lib64/mysql/plugin/selective_trace.so(+0x5806)
+/usr/lib64/mysql/plugin/selective_trace.so(+0x6dca)
+mysql_audit_notify(...)
+dispatch_command(...)
+```
+
+`addr2line` contra o `.so` (compilado com `-g`, símbolos completos)
+apontou exatamente `get_state()`, `selective_trace_mysql.cc:180` —
+`if (st->magic != STATE_MAGIC)`, ou seja, `THDVAR(thd, state)` retornou
+um ponteiro inválido e a primeira desreferência crashou.
+
+**Causa raiz**: a técnica emprestada do plugin MariaDB — um
+`MYSQL_THDVAR_STR` com `PLUGIN_VAR_MEMALLOC` cujo valor-default é um blob
+"pristine" sem NUL que o servidor copiaria (`strdup`-like) uma vez por
+conexão, dando um buffer POD de `sizeof(StatementState)` (~4,2 KB) por
+THD — **não funciona da mesma forma no MySQL 8.0/9.x**. Não foi possível
+confirmar a causa exata dentro do `sql_plugin.cc` do servidor sem uma
+sessão dedicada a isso (candidatos: `PLUGIN_VAR_NOSYSVAR` pode pular o
+`strdup()` automático nessa série; ou um valor-default desse tamanho é
+tratado diferente do que os exemplos mais curtos usados no MariaDB) — mas
+o fix não depende de saber qual exatamente.
+
+**Fix**: removida a dependência do blob THDVAR inteiramente.
+`StatementState` agora vive num `std::unordered_map<MYSQL_THD,
+StatementState>` global, protegido por um `mysql_rwlock_t` dedicado
+(`state_map_lock`), criado/destruído em `init`/`deinit`. Entradas são
+criadas sob demanda no primeiro evento de cada conexão e removidas no
+evento `MYSQL_AUDIT_CONNECTION_DISCONNECT` (novo: o plugin agora também
+assina `CONNECTION_CLASS`, só o subclass `DISCONNECT`). A limpeza roda
+independente de `selective_trace_enabled` (só depende de `plugin_ready`),
+pra não vazar uma entrada por conexão que desconecta com o tracing
+desligado. `std::unordered_map` garante estabilidade de ponteiro/
+referência dos elementos existentes através de inserts/rehashes (só
+apagar o próprio elemento invalida o ponteiro) — por isso `get_state()`
+pode devolver um `StatementState*` cru e seguro de usar pelo resto do
+processamento daquele evento sem segurar o lock o tempo todo.
+
+Validado depois do fix: `INSTALL PLUGIN` → `SET GLOBAL
+selective_trace_enabled=ON` → tráfego real rastreado (FILE e TABLE,
+ver 5.2) → nenhum crash, servidor seguiu no ar. Recompilado limpo contra
+8.0.40 e 9.7.2.
+
+### 5.2 — Modo TABLE: `mysql.session`@`localhost` precisa de GRANT explícito
+
+Depois do fix do crash, `INSERT`/`SELECT` rastreados não geravam erro
+nenhum, mas `mysql.selective_trace_events` nunca era criada. O log do
+`mysqld` mostrava `selective_trace: could not create
+mysql.selective_trace_events` (mensagem genérica — código original não
+expunha o erro real do servidor).
+
+Diagnóstico: `SHOW PROCESSLIST` revelou que a conexão interna do writer
+autentica como **`mysql.session`@`localhost`** — a conta de sistema
+interna que o MySQL usa por padrão para `mysql_command_services` quando
+`MYSQL_COMMAND_USER_NAME` não é setado explicitamente. Mesmo já tendo
+`SUPER` e outros privilégios administrativos por padrão, essa conta
+**não tem `CREATE`/`INSERT` em tabelas arbitrárias** — não é o
+equivalente do "skip_grants"/full-privilege interno que o
+`mysql_real_connect_local()` do MariaDB dá de graça. Isso é uma diferença
+de arquitetura real entre os dois mecanismos, não um bug.
+
+**Fix de operação** (não de código): documentado em `docs/USAGE.md` §1.1
+como pré-requisito obrigatório de instalação —
+
+```sql
+GRANT CREATE, INSERT, SELECT ON mysql.selective_trace_events
+  TO 'mysql.session'@'localhost';
+```
+
+**Fix de código complementar**: `log_writer_table_mysql.cc` ganhou
+`last_errmsg()` (usa `mysql_command_error_info::sql_error()`) — as
+mensagens de log agora incluem o texto real do erro do servidor, não só
+o número. Isso teria cortado o tempo de diagnóstico pela metade; sem
+isso, a única pista era o `errno` genérico.
+
+Validado depois do GRANT: reinstalar o plugin (conexão nova do writer,
+já com o privilégio em vigor) → `mysql.selective_trace_events` criada e
+populada corretamente com uma linha real
+(`testdb.pessoas`, `INSERT`, `5.003ms`). Modo FILE também validado no
+mesmo teste (JSON válido, uma linha por evento).
+
+### O que ainda falta da Etapa 5
+
+- Filtro por schema/tabela/conexão com múltiplas variações (só testado
+  schema simples).
+- `min_duration_ms`, `mask_passwords` em runtime.
+- `track_current_db()` (heurística de schema corrente) com `USE`
+  explícito — o teste rodado usava `db.tabela` totalmente qualificado
+  sem `USE`, então `db` saiu vazio no output (esperado, documentado, mas
+  não é a mesma coisa que confirmar a heurística funcionando).
+- Comportamento no `UNINSTALL PLUGIN` com o writer thread ainda
+  processando fila (shutdown gracioso) sob carga.
+- Valgrind e a bateria de segurança adversarial completa.
+- Mesmos testes funcionais contra MySQL 9.7.2 (só 8.0.40 foi exercitado
+  em runtime até agora).
 
 **Status: Etapa 1 fechada em 2026-08-06 — validada contra DUAS séries do
 MySQL.** `src/` compila e linka limpo (zero warnings) contra checkouts

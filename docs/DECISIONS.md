@@ -237,3 +237,49 @@ como fatal — fecha a conexão e retorna `false`, e o INSERT correspondente
 potencialmente inseguro. Recompilado e validado limpo contra MySQL
 8.0.40 e 9.7.2 depois do fix. O mesmo furo continua presente no plugin
 MariaDB irmão (fora do escopo deste repo corrigir).
+
+## 12. Estado por conexão: mapa próprio em vez do blob THDVAR (Etapa 5)
+
+Etapa 5 (2026-08-13, `docs/RESEARCH_NOTES_MYSQL.md` §5.1) achou que a
+técnica do blob "pristine" via `MYSQL_THDVAR_STR` — copiada do plugin
+MariaDB, onde funciona — **crasha o `mysqld` 8.0/9.x** logo no primeiro
+evento processado depois de `selective_trace_enabled=ON`
+(`THDVAR(thd, state)` volta um ponteiro inválido; `st->magic` estoura).
+Confirmado ao vivo, reproduzido de forma consistente, corrigido antes de
+qualquer uso real.
+
+Substituição: `StatementState` deixou de morar num blob "emprestado" do
+mecanismo de sysvar do servidor e passou a viver inteiramente sob
+controle do plugin — um `std::unordered_map<MYSQL_THD, StatementState>`
+global protegido por um `mysql_rwlock_t` próprio (`state_map_lock`).
+Motivos da escolha:
+
+- `std::unordered_map` garante estabilidade de ponteiro/referência para
+  elementos existentes através de inserções e rehashes (só apagar o
+  próprio elemento invalida o ponteiro — garantia da biblioteca padrão).
+  Isso permite `get_state()` devolver um `StatementState*` cru, seguro de
+  usar pelo resto do processamento do evento, sem segurar o lock durante
+  todo esse tempo.
+- Cada `THD` só é tocado por uma conexão/thread por vez (nunca duas
+  threads concorrentes para o mesmo `THD`), então não existe corrida de
+  "lost update" dentro de uma entrada — o rwlock protege só a estrutura
+  interna do mapa contra inserções/buscas concorrentes de *outras*
+  conexões.
+- Limpeza via `MYSQL_AUDIT_CONNECTION_DISCONNECT` — o plugin passou a
+  assinar também `CONNECTION_CLASS` (só esse subclass). A limpeza roda
+  independente de `selective_trace_enabled` (só depende de
+  `plugin_ready`), para não vazar uma entrada por conexão que desconecta
+  com o tracing desligado. Uma conexão que nunca dispara um `DISCONNECT`
+  limpo (kill abrupto, falha de rede) vaza uma entrada de ~4 KB —
+  aceito como bem melhor que a alternativa de derrubar o servidor.
+- O truque do "magic number" para detectar um blob "pristine" não é mais
+  necessário: `std::unordered_map::operator[]` em uma chave nova
+  value-inicializa o `StatementState` (zero-preenche todos os campos, já
+  que a struct não tem construtor definido pelo usuário), então uma
+  entrada nova já nasce zerada de graça.
+
+Trade-off aceito: uma tabela hash global com lock é mensuravelmente mais
+cara por evento do que um blob já alocado por THD teria sido *se
+funcionasse* — mas como a técnica original não funciona nesta série do
+servidor, a comparação é acadêmica. Não medido overhead real (Etapa 5
+ainda não fez benchmark formal).

@@ -16,25 +16,28 @@ choice was made.
 
 ## Status
 
-**Etapa 1 done — compiles and links against real MySQL 8.0.40 AND 9.7.2
-source trees; not yet run against a live server (Etapa 5).** The filter
-engine (`core/`) is ported, unit-tested and passing (194/194 checks). The
-MySQL-specific layer (`src/`) was built end-to-end via
-`docker/Dockerfile` + `scripts/build.sh` against real `mysql-server`
-checkouts of both `mysql-8.0.40` and `mysql-9.7.2`: `selective_trace.so`
-compiles with zero warnings on both and exports the symbols expected of a
-dynamic plugin (`_mysql_plugin_declarations_`, verified with `nm -D`).
-What's *not* done yet is loading it into a running `mysqld` (`INSTALL
-PLUGIN`) and any functional exercise (FILE, TABLE, filters) — see
-[`docs/RESEARCH_NOTES_MYSQL.md`](docs/RESEARCH_NOTES_MYSQL.md) for the
-exact remaining scope (Etapa 5), for the real compiler-verified facts
-that corrected several MariaDB-shaped assumptions along the way (e.g.
-`SYS_VAR`/`SHOW_VAR`, not `st_mysql_sys_var`/`st_mysql_show_var`, which
-don't exist in MySQL), and for what differs building against the 9.x
-series (toolchain flags, not the Audit API itself). Do not deploy this to
-production yet.
+**Etapa 5 in progress — `INSTALL PLUGIN` and both output modes have run
+successfully against a real, live `mysqld` 8.0.40.** The filter engine
+(`core/`) is ported, unit-tested and passing (194/194 checks). Both
+MySQL 8.0.40 and 9.7.2 source builds compile clean and export the
+expected dynamic-plugin symbols. Beyond that, this build has now been
+loaded into a real Docker `mysqld` 8.0.40 and exercised end to end:
+`INSTALL PLUGIN`, `SET GLOBAL selective_trace_enabled=ON`, and both FILE
+and TABLE output modes correctly captured a real traced query. Getting
+here surfaced and fixed two real issues a compiler alone couldn't catch
+— a **crash** (the MariaDB-borrowed per-connection state storage trick
+doesn't work on MySQL 8.0/9.x; redesigned around a plugin-owned
+`std::unordered_map`, see `docs/DECISIONS.md` §12) and a **required
+one-time `GRANT`** for TABLE mode (the writer's internal connection
+authenticates as the low-privilege `mysql.session` system account, not a
+superuser — see `docs/USAGE.md` §1.1). Filtering variations,
+`min_duration_ms`, `mask_passwords`, graceful `UNINSTALL` under load,
+Valgrind, the adversarial security suite, and any MySQL 9.7.2 runtime
+exercise are still open — see
+[`docs/RESEARCH_NOTES_MYSQL.md`](docs/RESEARCH_NOTES_MYSQL.md) "Etapa 5"
+for the exact remaining scope. Still not recommended for production.
 
-## Quick start (once Etapa 5 validation is done)
+## Quick start
 
 ```sql
 INSTALL PLUGIN selective_trace SONAME 'selective_trace.so';

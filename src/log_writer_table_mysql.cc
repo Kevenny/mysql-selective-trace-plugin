@@ -216,6 +216,32 @@ static void close_conn()
   }
 }
 
+/* writer thread only. mysql_command_error_info::sql_errno() writes the
+   errno through an out-parameter and returns bool (true = failed to
+   retrieve it) — it does not return the errno value directly. */
+static unsigned int last_errno()
+{
+  unsigned int err= 0;
+  if (com_error_info == NULL || command_h == NULL)
+    return 0;
+  if (com_error_info->sql_errno(command_h, &err))
+    return 0;
+  return err;
+}
+
+/* writer thread only. Same out-parameter convention as sql_errno(). The
+   returned pointer is only valid until the next call on this command
+   handle — copy it before logging if that ever changes. */
+static const char *last_errmsg()
+{
+  char *msg= NULL;
+  if (com_error_info == NULL || command_h == NULL)
+    return "(no connection)";
+  if (com_error_info->sql_error(command_h, &msg) || msg == NULL)
+    return "(error text unavailable)";
+  return msg;
+}
+
 /* writer thread only */
 static bool ensure_conn()
 {
@@ -284,22 +310,10 @@ static bool ensure_conn()
   }
   if (com_query->query(command_h, CREATE_LOG_TABLE_SQL,
                        sizeof(CREATE_LOG_TABLE_SQL) - 1))
-    fprintf(stderr, "selective_trace: could not create " LOG_TABLE_FQN "\n");
+    fprintf(stderr, "selective_trace: could not create " LOG_TABLE_FQN
+            " (errno %u: %s)\n", last_errno(), last_errmsg());
 
   return true;
-}
-
-/* writer thread only. mysql_command_error_info::sql_errno() writes the
-   errno through an out-parameter and returns bool (true = failed to
-   retrieve it) — it does not return the errno value directly. */
-static unsigned int last_errno()
-{
-  unsigned int err= 0;
-  if (com_error_info == NULL || command_h == NULL)
-    return 0;
-  if (com_error_info->sql_errno(command_h, &err))
-    return 0;
-  return err;
 }
 
 /* writer thread only */
@@ -337,7 +351,7 @@ static void run_insert(const std::string &sql)
   {
     last_logged_errno= err;
     fprintf(stderr, "selective_trace: INSERT into " LOG_TABLE_FQN
-            " failed (errno %u)\n", err);
+            " failed (errno %u: %s)\n", err, last_errmsg());
   }
 }
 
