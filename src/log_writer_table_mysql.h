@@ -57,6 +57,16 @@ bool table_writer_is_self();
 unsigned long table_writer_failures();
 unsigned long table_writer_dropped();
 
+/*
+  Periodic internal-connection recycles since the plugin was loaded.
+  The writer deliberately tears down and reopens its connection every N
+  inserts to bound server-side memory growth — see
+  writer_recycle_policy.h. A steadily climbing value here is normal
+  under sustained TABLE-mode tracing (roughly events/20000), not a sign
+  of connection trouble.
+*/
+unsigned long table_writer_reconnects();
+
 } /* namespace selective_trace */
 
 #endif /* SELECTIVE_TRACE_LOG_WRITER_TABLE_MYSQL_H */

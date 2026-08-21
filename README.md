@@ -18,7 +18,8 @@ choice was made.
 
 **Etapa 5 in progress — `INSTALL PLUGIN` and both output modes have run
 successfully against a real, live `mysqld` 8.0.40.** The filter engine
-(`core/`) is ported, unit-tested and passing (194/194 checks). Both
+(`core/`) is ported, unit-tested and passing (194/194 checks; 234 across
+both suites, including the TABLE writer recycling policy). Both
 MySQL 8.0.40 and 9.7.2 source builds compile clean and export the
 expected dynamic-plugin symbols. Beyond that, this build has now been
 loaded into a real Docker `mysqld` 8.0.40 and exercised end to end:
@@ -85,7 +86,9 @@ mysql-selective-trace-plugin/
 │   ├── CMakeLists.txt
 │   ├── selective_trace_mysql.cc    # entrypoint: descriptor, sysvars, event capture
 │   ├── log_writer_file_mysql.h/.cc
-│   └── log_writer_table_mysql.h/.cc
+│   ├── log_writer_table_mysql.h/.cc
+│   ├── writer_recycle_policy.h     # TABLE writer connection recycling (DECISIONS.md #13)
+│   └── test_writer_recycle.cc      # 40 checks, no server headers
 ├── docker/Dockerfile               # MySQL 8.0 source + C++17 toolchain (OL8)
 ├── scripts/build.sh
 └── docs/
@@ -94,14 +97,20 @@ mysql-selective-trace-plugin/
     └── USAGE.md                    # operator guide
 ```
 
-## Running the core unit tests
+## Running the unit tests
 
-No server headers needed — pure C++17:
+Two suites, 234 checks total. No server headers needed — pure C++17:
 
 ```bash
+# filter engine (194 checks)
 g++ -std=c++17 -Wall -Wextra -Werror -I core \
     core/test_filter_logic.cc core/filter_engine.cc \
     -o test_filter_logic && ./test_filter_logic
+
+# TABLE writer connection-recycling policy (40 checks)
+g++ -std=c++17 -Wall -Wextra -Werror -I src \
+    src/test_writer_recycle.cc \
+    -o test_writer_recycle && ./test_writer_recycle
 ```
 
 ## License

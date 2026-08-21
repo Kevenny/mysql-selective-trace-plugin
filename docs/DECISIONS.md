@@ -283,3 +283,97 @@ cara por evento do que um blob já alocado por THD teria sido *se
 funcionasse* — mas como a técnica original não funciona nesta série do
 servidor, a comparação é acadêmica. Não medido overhead real (Etapa 5
 ainda não fez benchmark formal).
+
+## 13. Reciclagem periódica da conexão do writer TABLE
+
+O plugin irmão MariaDB reportou (v1.2.2) crescimento **ilimitado** de RSS
+no modo TABLE sob carga sustentada — ~11-12 KB por evento gravado, até o
+OOM killer derrubar o serviço. Causa raiz lá: a thread do writer mantém
+uma única conexão SQL interna (e sua THD no servidor) viva para sempre,
+reusada para milhões de INSERTs; essa THD de vida longa acumula
+fragmentação de heap. Não é ponteiro perdido — Valgrind num ciclo
+completo reporta 0 bytes lost / 0 reachable; a memória é liberada, mas
+fica intercalada com blocos vivos na mesma arena de longa duração e nunca
+volta ao SO (`malloc_trim` também não ajuda). O fix lá foi reciclar a
+conexão a cada 20.000 eventos.
+
+**Este porte tinha o mesmo padrão estrutural** — `ensure_conn()` retorna
+cedo se `command_h != NULL`, e a conexão só era fechada em caminho de
+erro ou no shutdown da thread. Ou seja: mesma conexão de vida longa,
+mesma THD reusada indefinidamente.
+
+Foi aplicado o mesmo fix, mas com uma diferença de engenharia: a política
+de "quando reciclar" foi extraída para `src/writer_recycle_policy.h` —
+uma unidade pura, sem dependência de servidor — em vez de ficar inline no
+loop da thread como no MariaDB. Isso a torna testável: 40 checks em
+`src/test_writer_recycle.cc` cobrem os limites de período (não recicla
+antes do threshold, recicla exatamente nele, contador reseta sem drift),
+`floor(N/threshold)` reciclagens para N inserts, threshold 1 e 0
+(desabilitado), o invariante que realmente limita o RSS (nenhuma conexão
+acumula mais que `threshold` inserts) e reset fora de banda quando o
+servidor derruba a conexão. O MariaDB corrigiu sem nenhum teste unitário
+para essa lógica.
+
+### Achado importante: o vazamento NÃO se reproduz no MySQL
+
+Medido ao vivo (mysqld 8.0.40 em Docker, modo TABLE, containers
+reiniciados entre braços para baseline limpo), com um braço de controle
+para separar o ruído do InnoDB:
+
+**Teste 1 — 100k statements, serial (sem saturar a fila):**
+
+| Braço | Δ RSS | KB/evento | reconnects |
+|---|---:|---:|---:|
+| Controle (tracing OFF) | 13 MB | 0,13 | 0 |
+| Sem reciclagem (comportamento antigo) | 36 MB | 0,37 | 0 |
+| Com reciclagem (o fix) | 35 MB | 0,36 | 5 |
+
+Se o padrão do MariaDB (11-12 KB/evento) valesse aqui, 100k eventos
+teriam custado ~1,1 GB. Custaram 36 MB — e desses, 13 MB são o baseline
+do próprio InnoDB (as 100k linhas de `testdb.loadtest`), sobrando ~23 MB
+atribuíveis ao tracing, que incluem as 100k linhas gravadas em
+`mysql.selective_trace_events`.
+
+**Teste 2 — 600k eventos gerados, 8 conexões concorrentes** (fila satura,
+~500k dropados por backpressure; o writer processou ~97k inserts em cada
+braço, que é o que importa para a memória da THD dele):
+
+| Braço | Δ RSS | reconnects | gravados | dropados | failures |
+|---|---:|---:|---:|---:|---:|
+| Sem reciclagem | 73 MB | 0 | 96.838 | 503.163 | 0 |
+| Com reciclagem | 68 MB | 4 | 98.247 | 501.753 | 0 |
+
+As séries temporais amostradas a cada 30s são praticamente sobrepostas
+(416→466 MB sem o fix, 418→464 MB com ele), crescimento linear e suave
+nos dois, **sem divergência** — que é exatamente o sinal que apareceria
+se a conexão de vida longa estivesse acumulando. O crescimento residual
+acompanha o volume de dados carregados no buffer pool do InnoDB (600k
+linhas em `testdb.loadtest` + ~97k em `mysql.selective_trace_events`),
+não o writer.
+
+Conclusão: **o `mysql_command_services` do MySQL não acumula como o
+`mysql_real_connect_local()` do MariaDB** — são mecanismos diferentes de
+conexão interna e não compartilham esse comportamento, ao menos até a
+escala testada. Os 4 reconnects observados batem com o esperado
+(98.247/20.000 = 4), confirmando que a política funciona mecanicamente.
+
+**Por que o fix foi mantido mesmo assim:**
+
+1. O padrão estrutural de risco (uma THD reusada indefinidamente) existe
+   de fato no código, mesmo que sua manifestação de memória não tenha
+   aparecido nesta escala/versão.
+2. O custo é desprezível e mensurado: ~1 reconnect a cada 20k eventos,
+   sem impacto observável na duração da carga (416s com fix vs 415s sem
+   no teste serial; 450s idênticos no concorrente) nem em confiabilidade
+   (0 write failures nos quatro braços; nenhuma diferença material de
+   eventos dropados sob saturação de fila).
+3. Mantém paridade de comportamento com o plugin irmão, que é um objetivo
+   declarado do porte — um bug de "cérebro" precisa valer nos dois, e o
+   mesmo vale para uma mitigação de recurso.
+4. Defesa em profundidade contra versões futuras do MySQL, ou padrões de
+   carga não testados aqui, em que o acúmulo possa se manifestar.
+
+O contador é exposto como `selective_trace_writer_reconnects`
+(`SHOW GLOBAL STATUS`), espelhando o `Selective_trace_writer_reconnects`
+do MariaDB. Um valor subindo em ~eventos/20000 é o funcionamento normal,
+não sinal de problema de conexão.

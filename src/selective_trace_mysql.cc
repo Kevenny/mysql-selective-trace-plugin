@@ -514,6 +514,7 @@ static SYS_VAR *selective_trace_sysvars[]=
 static ulong status_events_logged= 0;
 static ulong status_write_failures= 0;
 static ulong status_events_dropped= 0;
+static ulong status_writer_reconnects= 0;
 
 /*
   Confirmed against the real MySQL 8.0.40 headers (include/mysql/status_var.h):
@@ -544,10 +545,28 @@ static int show_events_dropped(MYSQL_THD thd __attribute__((unused)),
   return 0;
 }
 
+/*
+  Periodic recycles of the TABLE writer's internal connection. Expected to
+  climb steadily (~events/20000) under sustained TABLE-mode tracing — it
+  is the mechanism that keeps server RSS bounded, not an error counter.
+  See src/writer_recycle_policy.h.
+*/
+static int show_writer_reconnects(MYSQL_THD thd __attribute__((unused)),
+                                  SHOW_VAR *var,
+                                  char *buff __attribute__((unused)))
+{
+  status_writer_reconnects= selective_trace::table_writer_reconnects();
+  var->type= SHOW_LONG;
+  var->value= (char *) &status_writer_reconnects;
+  return 0;
+}
+
 static SHOW_VAR selective_trace_status[]=
 {
   { "selective_trace_events_logged", (char *) &status_events_logged,
     SHOW_LONG, SHOW_SCOPE_GLOBAL },
+  { "selective_trace_writer_reconnects", (char *) show_writer_reconnects,
+    SHOW_FUNC, SHOW_SCOPE_GLOBAL },
   { "selective_trace_write_failures", (char *) show_write_failures,
     SHOW_FUNC, SHOW_SCOPE_GLOBAL },
   { "selective_trace_events_dropped", (char *) show_events_dropped,

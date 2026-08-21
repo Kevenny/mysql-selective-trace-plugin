@@ -192,7 +192,10 @@ LIMIT 20;
 
 The writer thread runs its own `INSERT`s through a dedicated internal
 connection (see `docs/DECISIONS.md` §5) and is excluded from tracing
-itself — no self-log loop.
+itself — no self-log loop. That connection is deliberately torn down and
+reopened every 20 000 inserts to bound server-side memory growth; the
+recycles are counted in `selective_trace_writer_reconnects` and are
+normal operation, not errors (see `docs/DECISIONS.md` §13).
 
 ## 5. Status variables
 
@@ -205,6 +208,7 @@ SHOW GLOBAL STATUS LIKE 'selective_trace%';
 | `selective_trace_events_logged` | Total events written since plugin load. |
 | `selective_trace_write_failures` | Failed writes (FILE) or INSERTs (TABLE). |
 | `selective_trace_events_dropped` | TABLE mode: events dropped because the internal queue was full (10 000 pending events). |
+| `selective_trace_writer_reconnects` | TABLE mode: periodic recycles of the writer's internal connection (~1 per 20 000 events). **Expected to climb under load** — this is the mechanism that bounds server memory growth, not an error counter. |
 | `selective_trace_callback_errors` | Exceptions caught at the audit-callback C boundary (should stay at 0). |
 
 ## 6. Disabling / removing

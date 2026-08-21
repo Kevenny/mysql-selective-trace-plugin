@@ -100,6 +100,55 @@ populada corretamente com uma linha real
 (`testdb.pessoas`, `INSERT`, `5.003ms`). Modo FILE também validado no
 mesmo teste (JSON válido, uma linha por evento).
 
+### 5.3 — Vazamento de RSS do MariaDB: padrão presente, sintoma ausente
+
+O plugin irmão MariaDB reportou (v1.2.2) RSS crescendo sem limite no modo
+TABLE — ~11-12 KB por evento, até OOM — causado pela conexão interna do
+writer (e sua THD) viver para sempre e acumular fragmentação de heap.
+Este porte tinha **o mesmo padrão estrutural** no código
+(`ensure_conn()` sai cedo se `command_h != NULL`; a conexão só fechava em
+erro ou no shutdown).
+
+Medido ao vivo aqui (mysqld 8.0.40, modo TABLE, container reiniciado
+entre braços, com um braço de controle para isolar o ruído do InnoDB):
+
+Teste 1 — 100k statements serial:
+
+| Braço | Δ RSS | KB/evento | reconnects |
+|---|---:|---:|---:|
+| Controle (tracing OFF) | 13 MB | 0,13 | 0 |
+| Sem reciclagem | 36 MB | 0,37 | 0 |
+| Com reciclagem (fix) | 35 MB | 0,36 | 5 |
+
+Teste 2 — 600k eventos gerados, 8 conexões (fila satura; o writer
+processou ~97k inserts por braço):
+
+| Braço | Δ RSS | reconnects | gravados | dropados |
+|---|---:|---:|---:|---:|
+| Sem reciclagem | 73 MB | 0 | 96.838 | 503.163 |
+| Com reciclagem | 68 MB | 4 | 98.247 | 501.753 |
+
+**O sintoma não se reproduz nesta série.** Com 11-12 KB/evento, 100k
+eventos custariam ~1,1 GB; custaram 36 MB, dos quais 13 MB são o baseline
+do InnoDB (as próprias linhas inseridas). No teste concorrente, as séries
+temporais dos dois braços amostradas a cada 30s ficam praticamente
+sobrepostas (416→466 MB sem o fix, 418→464 MB com), crescendo linear e
+suavemente **sem divergir** — e divergência é justamente o que apareceria
+se a conexão de vida longa estivesse acumulando. Ou seja: o
+`mysql_command_services` do MySQL não acumula como o
+`mysql_real_connect_local()` do MariaDB — mecanismos diferentes de
+conexão interna, comportamento de memória diferente. Os reconnects
+observados batem com o esperado (98.247/20.000 = 4), então a política
+funciona mecanicamente; simplesmente não há, aqui, o vazamento que ela
+mitiga lá.
+
+O fix (reciclagem a cada 20k inserts) foi mantido mesmo assim — o padrão
+de risco existe no código, o custo medido é nulo (416s com vs 415s sem,
+0 dropped, 0 failures nos dois), e mantém paridade com o plugin irmão.
+Racional completo em `docs/DECISIONS.md` §13. Método de reprodução: os
+binários A/B saem do mesmo build recompilando só a TU do writer com
+`-DSELECTIVE_TRACE_RECONNECT_EVERY=0` (comportamento antigo).
+
 ### O que ainda falta da Etapa 5
 
 - Filtro por schema/tabela/conexão com múltiplas variações (só testado

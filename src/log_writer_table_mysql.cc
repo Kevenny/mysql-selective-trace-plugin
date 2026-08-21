@@ -54,6 +54,7 @@
 #include <cstdio>
 
 #include "log_writer_table_mysql.h"
+#include "writer_recycle_policy.h"
 
 namespace selective_trace {
 
@@ -87,6 +88,18 @@ static pthread_t writer_tid;
 static unsigned long insert_failures= 0;
 static unsigned long dropped_events= 0;
 static unsigned int last_logged_errno= 0;
+
+/*
+  Bounds how many inserts a single internal connection (and its
+  server-side THD) accumulates before being torn down — without this the
+  server's RSS climbs without bound under sustained tracing. See
+  writer_recycle_policy.h for the full explanation and measurements.
+
+  Writer thread only, except recycles() which SHOW STATUS reads without
+  synchronization — same benign unsynchronized-counter pattern already
+  used by insert_failures/dropped_events above.
+*/
+static WriterRecyclePolicy recycle_policy;
 
 /* ------------------------------------------------------------------------
    mysql_command_services plumbing — writer thread only. Acquired once per
@@ -340,6 +353,10 @@ static void run_insert(const std::string &sql)
   else if (err == 2006 || err == 2013)  /* connection gone: retry once */
   {
     close_conn();
+    /* out-of-band drop: the retry gets a brand new THD with a fresh
+       arena, so the periodic recycle counter restarts from here (this
+       is not counted as one of our own recycles) */
+    recycle_policy.note_connection_reset();
     if (ensure_conn() &&
         com_query->query(command_h, sql.data(), sql.size()) == 0)
       return;
@@ -358,6 +375,13 @@ static void run_insert(const std::string &sql)
 static void *writer_thread_func(void *arg __attribute__((unused)))
 {
   std::deque<std::string> batch;
+
+  /* A restarted writer thread always starts on a fresh connection, so
+     drop any insert count left over from the previous run (the total
+     recycle count is deliberately kept — it is a since-plugin-load
+     statistic). */
+  recycle_policy.note_connection_reset();
+
   for (;;)
   {
     pthread_mutex_lock(&q_mutex);
@@ -378,6 +402,13 @@ static void *writer_thread_func(void *arg __attribute__((unused)))
       {
         insert_failures++;
       }
+
+      /* Recycle between inserts, never mid-insert. close_conn() only
+         closes; the next run_insert() reopens lazily via ensure_conn(),
+         so a writer that goes idle right here holds no connection at
+         all until the next event arrives. */
+      if (recycle_policy.note_insert())
+        close_conn();
     }
     batch.clear();
 
@@ -482,6 +513,11 @@ bool table_writer_enqueue(std::string *sql)
 unsigned long table_writer_failures()
 {
   return insert_failures;
+}
+
+unsigned long table_writer_reconnects()
+{
+  return recycle_policy.recycles();
 }
 
 unsigned long table_writer_dropped()
